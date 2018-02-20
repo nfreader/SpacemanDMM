@@ -239,6 +239,12 @@ pub enum Term {
     Float(f32),
     /// An expression contained in a term.
     Expr(Box<Expression>),
+    /// The current proc's return value (`.`).
+    ReturnValue,
+    /// A use of the `call()()` primitive.
+    DynamicCall(Vec<Expression>, Vec<Expression>),
+    /// An interpolated string, alternating string/expr/string/expr.
+    InterpString(String, Vec<(Expression, String)>),
 }
 
 impl From<Expression> for Term {
@@ -268,4 +274,22 @@ pub enum Follow {
     Call(String, Vec<Expression>),
     /// Cast the value using the "as" operator.
     Cast(String),
+}
+
+/// A parameter declaration in the header of a proc.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Parameter {
+    pub path: Vec<String>,
+    pub name: String,
+    pub default: Option<Expression>,
+    pub as_types: Option<Vec<String>>,
+    pub in_list: Option<Expression>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum Statement {
+    Expr(Expression),
+    Return(Option<Expression>),
+    While(Expression, Vec<Statement>),
+    If(Vec<(Expression, Vec<Statement>)>, Option<Vec<Statement>>),
 }

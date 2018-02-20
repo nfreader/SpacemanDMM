@@ -11,8 +11,6 @@ use dmi::{Image, IconFile};
 use render_passes::RenderPass;
 
 const TILE_SIZE: u32 = 32;
-const CONTRABAND_POSTERS: u32 = 44;
-const LEGIT_POSTERS: u32 = 35;
 
 // ----------------------------------------------------------------------------
 // Main minimap code
@@ -24,17 +22,15 @@ pub struct Context<'a> {
     pub grid: Grid<'a>,
     pub min: (usize, usize),
     pub max: (usize, usize),
+    pub render_passes: &'a [Box<RenderPass>],
 }
 
 pub fn generate(
     ctx: Context,
     icon_cache: &mut HashMap<PathBuf, IconFile>,
-    render_passes: &[Box<RenderPass>],
 ) -> Result<Image, ()> {
-    use rand::Rng;
-
     flame!("minimap");
-    let Context { objtree, map, grid, .. } = ctx;
+    let Context { objtree, map, grid, render_passes, .. } = ctx;
 
     // transform min/max from bottom-left-based to top-left-based
     // probably doesn't belong here
@@ -51,7 +47,7 @@ pub fn generate(
         if y < min_y || y > max_y { continue }
         for (x, e) in row.iter().enumerate() {
             if x < ctx.min.0 || x > ctx.max.0 { continue }
-            for mut atom in get_atom_list(objtree, &map.dictionary[e], (x as u32, y as u32)) {
+            for mut atom in get_atom_list(objtree, &map.dictionary[e], (x as u32, y as u32), render_passes) {
                 // icons which differ from their map states
                 let p = &atom.type_.path;
                 if p == "/obj/structures/table/wood/fancy/black" {
@@ -61,19 +57,10 @@ pub fn generate(
                 } else if subtype(p, "/turf/closed/mineral/") {
                     atom.set_var("pixel_x", Constant::Int(-4));
                     atom.set_var("pixel_y", Constant::Int(-4));
-                } else if subtype(p, "/obj/structure/bookcase/") {
-                    atom.set_var("icon_state", Constant::string("book-0"));
-                } else if subtype(p, "/obj/structure/sign/poster/contraband/random/") {
-                    atom.set_var("icon_state", Constant::string(format!("poster{}", ::rand::thread_rng().gen_range(1, 1 + CONTRABAND_POSTERS))));
-                } else if subtype(p, "/obj/structure/sign/poster/official/random/") {
-                    atom.set_var("icon_state", Constant::string(format!("poster{}_legit", ::rand::thread_rng().gen_range(1, 1 + LEGIT_POSTERS))));
-                } else if subtype(p, "/obj/structure/sign/poster/random/") {
-                    let i = 1 + ::rand::thread_rng().gen_range(0, CONTRABAND_POSTERS + LEGIT_POSTERS);
-                    if i <= CONTRABAND_POSTERS {
-                        atom.set_var("icon_state", Constant::string(format!("poster{}", i)));
-                    } else {
-                        atom.set_var("icon_state", Constant::string(format!("poster{}_legit", i - CONTRABAND_POSTERS)));
-                    }
+                }
+
+                for pass in render_passes {
+                    pass.adjust_vars(&mut atom, &objtree);
                 }
 
                 // overlays and underlays
@@ -119,8 +106,6 @@ pub fn generate(
                         copy.set_var("icon_state", keyboard.clone());
                         overlays.push(copy);
                     }
-                } else if subtype(p, "/obj/structure/transit_tube/") {
-                    generate_tube_overlays(&mut overlays, ctx, &atom);
                 } else if subtype(p, "/obj/machinery/door/airlock/") {
                     let mut copy = atom.clone();
                     if atom.get_var("glass", objtree).to_bool() {
@@ -146,10 +131,6 @@ pub fn generate(
                         add_overlay!(aboveground);
                         atom.set_var("layer", Constant::Int(-5));
                     }
-                } else if subtype(p, "/obj/item/storage/box/") && !subtype(p, "/obj/item/storage/box/papersack/") {
-                    let mut copy = atom.clone();
-                    copy.set_var("icon_state", atom.get_var("illustration", objtree).clone());
-                    overlays.push(copy);
                 } else if subtype(p, "/obj/machinery/power/apc/") {
                     use dmi::*;
                     // auto-set pixel location
@@ -168,9 +149,10 @@ pub fn generate(
                     let mut terminal = Atom::from_type(objtree, "/obj/machinery/power/terminal", atom.loc).unwrap();
                     terminal.copy_var("dir", &atom, objtree);
                     atoms.push(terminal);
-                } else if subtype(p, "/obj/machinery/firealarm/") {
-                    add_overlay!("overlay_0");
-                    add_overlay!("overlay_clear");
+                }
+
+                for pass in render_passes {
+                    pass.overlays(&mut atom, objtree, &mut atoms, &mut overlays);
                 }
 
                 // smoothing time
@@ -187,7 +169,7 @@ pub fn generate(
     'atom: for atom in atoms {
         // At this time, space is invisible. Earlier steps need to process it.
         for pass in render_passes.iter() {
-            if !pass.final_filter(&atom, objtree) {
+            if !pass.late_filter(&atom, objtree) {
                 continue 'atom;
             }
         }
@@ -267,14 +249,21 @@ pub fn generate(
     Ok(map_image)
 }
 
-pub fn get_atom_list<'a>(objtree: &'a ObjectTree, prefabs: &'a [Prefab], loc: (u32, u32)) -> Vec<Atom<'a>> {
+pub fn get_atom_list<'a>(
+    objtree: &'a ObjectTree,
+    prefabs: &'a [Prefab],
+    loc: (u32, u32),
+    render_passes: &[Box<RenderPass>],
+) -> Vec<Atom<'a>> {
     flame!("get_atom_list");
     let mut result = Vec::new();
 
-    for fab in prefabs {
-        if subtype(&fab.path, "/area/") { continue }
-        let spawner = subtype(&fab.path, "/obj/effect/spawner/structure/");
-        if subtype(&fab.path, "/obj/effect/spawner/") && !spawner { continue }
+    'fab: for fab in prefabs {
+        for pass in render_passes {
+            if !pass.path_filter(&fab.path) {
+                continue 'fab;
+            }
+        }
 
         // look up the type
         let atom = match Atom::from_prefab(objtree, fab, loc) {
@@ -285,43 +274,19 @@ pub fn get_atom_list<'a>(objtree: &'a ObjectTree, prefabs: &'a [Prefab], loc: (u
             }
         };
 
-        // invisible objects and syndicate balloons are not to show
-        if atom.get_var("invisibility", objtree).to_float().unwrap_or(0.) > 60. {
-            continue;
-        }
-        if atom.get_var("icon", objtree).eq_resource("icons/obj/items_and_weapons.dmi") &&
-            atom.get_var("icon_state", objtree).eq_string("syndballoon")
-        {
-            continue
+        for pass in render_passes {
+            if !pass.early_filter(&atom, objtree) {
+                continue 'fab;
+            }
         }
 
         // convert structure spanwers to their structures
-        if spawner {
-            match atom.get_var("spawn_list", objtree) {
-                &Constant::List(ref elements) => {
-                    for &(ref key, _) in elements {
-                        // TODO: use a more civilized lookup method
-                        let mut type_key = String::new();
-                        let reference;
-                        match key {
-                            &Constant::String(ref s) => reference = s,
-                            &Constant::Prefab(ref fab) => {
-                                for each in fab.path.iter() {
-                                    use std::fmt::Write;
-                                    let _ = write!(type_key, "{}{}", each.0, each.1);
-                                }
-                                reference = &type_key;
-                            }
-                            _ => continue,
-                        }
-                        result.push(Atom::from_type(objtree, reference, loc).unwrap());
-                    }
-                }
-                _ => {}  // TODO: complain?
+        for pass in render_passes {
+            if pass.expand(&atom, objtree, &mut result) {
+                continue 'fab;
             }
-        } else {
-            result.push(atom);
         }
+        result.push(atom);
     }
 
     result
@@ -337,22 +302,22 @@ pub struct Atom<'a> {
     type_: &'a Type,
     prefab: Option<&'a Vars>,
     vars: Vars,
-    loc: (u32, u32),
+    pub loc: (u32, u32),
 }
 
 impl<'a> Atom<'a> {
-    fn from_prefab(objtree: &'a ObjectTree, fab: &'a Prefab, loc: (u32, u32)) -> Option<Self> {
+    pub fn from_prefab(objtree: &'a ObjectTree, fab: &'a Prefab, loc: (u32, u32)) -> Option<Self> {
         objtree.find(&fab.path).map(|type_| Atom {
-            type_,
+            type_: type_.get(),
             prefab: Some(&fab.vars),
             vars: Default::default(),
             loc,
         })
     }
 
-    fn from_type(objtree: &'a ObjectTree, path: &str, loc: (u32, u32)) -> Option<Self> {
+    pub fn from_type(objtree: &'a ObjectTree, path: &str, loc: (u32, u32)) -> Option<Self> {
         objtree.find(path).map(|type_| Atom {
-            type_,
+            type_: type_.get(),
             prefab: None,
             vars: Default::default(),
             loc,
@@ -374,7 +339,7 @@ impl<'a> Atom<'a> {
         }
     }
 
-    pub fn get_var_spec(&self, key: &str, objtree: &'a ObjectTree) -> Option<&Constant> {
+    fn get_var_spec(&self, key: &str, objtree: &'a ObjectTree) -> Option<&Constant> {
         if let Some(v) = self.vars.get(key) {
             return Some(v);
         }
@@ -393,13 +358,13 @@ impl<'a> Atom<'a> {
         None
     }
 
-    fn copy_var(&mut self, key: &str, from: &Atom, objtree: &'a ObjectTree) {
+    pub fn copy_var(&mut self, key: &str, from: &Atom, objtree: &'a ObjectTree) {
         if let Some(var) = from.get_var_notnull(key, objtree) {
             self.set_var(key, var.clone());
         }
     }
 
-    fn set_var<K: Into<String>>(&mut self, key: K, value: Constant) {
+    pub fn set_var<K: Into<String>>(&mut self, key: K, value: Constant) {
         self.vars.insert(key.into(), value);
     }
 }
@@ -518,7 +483,7 @@ fn find_type_in_direction<'a>(ctx: Context, source: &Atom, direction: i32, flags
     // TODO: make this not call get_atom_list way too many times
     let atom_list = get_atom_list(ctx.objtree,
         &ctx.map.dictionary[&ctx.grid[ndarray::Dim([new_loc.1 as usize, new_loc.0 as usize])]],
-        new_loc);
+        new_loc, ctx.render_passes);
     match source.get_var("canSmoothWith", ctx.objtree) {
         &Constant::List(ref elements) => if flags & SMOOTH_MORE != 0 {
             // smooth with canSmoothWith + subtypes
@@ -630,7 +595,7 @@ fn diagonal_smooth<'a>(output: &mut Vec<Atom<'a>>, ctx: Context<'a>, source: &At
                     // TODO: make this not call get_atom_list way too many times
                     let atom_list = get_atom_list(ctx.objtree,
                         &ctx.map.dictionary[&ctx.grid[ndarray::Dim([new_loc.1 as usize, new_loc.0 as usize])]],
-                        new_loc);
+                        new_loc, ctx.render_passes);
                     for mut atom in atom_list {
                         if subtype(&atom.type_.path, "/turf/open/") {
                             atom.loc = source.loc;
@@ -744,111 +709,3 @@ fn right_45(dir: i32) -> i32 {
     }
 }
 
-// ----------------------------------------------------------------------------
-// Transit tube smoothing
-
-fn generate_tube_overlays<'a>(output: &mut Vec<Atom<'a>>, ctx: Context<'a>, source: &Atom<'a>) {
-    use dmi::*;
-
-    let dir = source.get_var("dir", ctx.objtree).to_int().unwrap_or(::dmi::SOUTH);
-
-    let mut fulfill = |items: &[i32]| {
-        for &dir in items {
-            if dir == NORTHEAST || dir == NORTHWEST || dir == SOUTHEAST || dir == SOUTHWEST {
-                if dir & NORTH != 0 {
-                    create_tube_overlay(output, ctx, source, dir ^ 3, NORTH);
-                    if dir & EAST != 0 {
-                        create_tube_overlay(output, ctx, source, dir ^ 12, EAST);
-                    } else {
-                        create_tube_overlay(output, ctx, source, dir ^ 12, WEST);
-                    }
-                }
-            } else {
-                create_tube_overlay(output, ctx, source, dir, 0);
-            }
-        }
-    };
-
-    let p = &source.type_.path;
-    if subtype(p, "/obj/structure/transit_tube/station/reverse/") {
-        fulfill(&match dir {
-            NORTH => [EAST],
-            SOUTH => [WEST],
-            EAST => [SOUTH],
-            WEST => [NORTH],
-            _ => return,
-        })
-    } else if subtype(p, "/obj/structure/transit_tube/station/") {
-        fulfill(&match dir {
-            NORTH | SOUTH => [EAST, WEST],
-            EAST | WEST => [NORTH, SOUTH],
-            _ => return,
-        })
-    } else if subtype(p, "/obj/structure/transit_tube/junction/flipped/") {
-        fulfill(&match dir {
-            NORTH => [NORTH, SOUTHWEST, SOUTHEAST],
-            SOUTH => [SOUTH, NORTHEAST, NORTHWEST],
-            EAST => [EAST, NORTHWEST, SOUTHWEST],
-            WEST => [WEST, SOUTHEAST, NORTHEAST],
-            _ => return,
-        })
-    } else if subtype(p, "/obj/structure/transit_tube/junction/") {
-        fulfill(&match dir {
-            NORTH => [NORTH, SOUTHEAST, SOUTHWEST],
-            SOUTH => [SOUTH, NORTHWEST, NORTHEAST],
-            EAST => [EAST, SOUTHWEST, NORTHWEST],
-            WEST => [WEST, NORTHEAST, SOUTHEAST],
-            _ => return,
-        })
-    } else if subtype(p, "/obj/structure/transit_tube/curved/flipped/") {
-        fulfill(&match dir {
-            NORTH => [NORTH, SOUTHEAST],
-            SOUTH => [SOUTH, NORTHWEST],
-            EAST => [EAST, SOUTHWEST],
-            WEST => [NORTHEAST, WEST],
-            _ => return,
-        })
-    } else if subtype(p, "/obj/structure/transit_tube/curved/") {
-        fulfill(&match dir {
-            NORTH => [NORTH, SOUTHWEST],
-            SOUTH => [SOUTH, NORTHEAST],
-            EAST => [EAST, NORTHWEST],
-            WEST => [SOUTHEAST, WEST],
-            _ => return,
-        })
-    } else if subtype(p, "/obj/structure/transit_tube/diagonal/") {
-        fulfill(&match dir {
-            NORTH | SOUTH => [NORTHEAST, SOUTHWEST],
-            EAST | WEST => [NORTHWEST, SOUTHEAST],
-            _ => return,
-        })
-    } else {
-        fulfill(&match dir {
-            NORTH | SOUTH => [NORTH, SOUTH],
-            EAST | WEST => [EAST, WEST],
-            _ => return,
-        })
-    }
-}
-
-fn create_tube_overlay<'a>(output: &mut Vec<Atom<'a>>, ctx: Context<'a>, source: &Atom<'a>, dir: i32, shift: i32) {
-    use dmi::*;
-
-    let mut copy = Atom::from_type(ctx.objtree, "/atom", source.loc).unwrap();
-    copy.set_var("dir", Constant::Int(dir));
-    copy.copy_var("layer", source, ctx.objtree);
-    copy.copy_var("icon", source, ctx.objtree);
-    if shift != 0 {
-        copy.set_var("icon_state", Constant::string("decorative_diag"));
-        match shift {
-            NORTH => copy.set_var("pixel_y", Constant::Int(32)),
-            SOUTH => copy.set_var("pixel_y", Constant::Int(-32)),
-            EAST => copy.set_var("pixel_x", Constant::Int(32)),
-            WEST => copy.set_var("pixel_x", Constant::Int(-32)),
-            _ => {}
-        }
-    } else {
-        copy.set_var("icon_state", Constant::string("decorative"));
-    }
-    output.push(copy);
-}

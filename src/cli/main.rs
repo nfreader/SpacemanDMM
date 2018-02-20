@@ -3,6 +3,10 @@
 extern crate structopt;
 #[macro_use] extern crate structopt_derive;
 
+extern crate serde;
+extern crate serde_json;
+#[macro_use] extern crate serde_derive;
+
 extern crate dreammaker as dm;
 #[macro_use] extern crate dmm_tools;
 
@@ -81,12 +85,12 @@ enum Command {
         max: Option<CoordArg>,
 
         /// Enable render-passes, or "all" to only exclude those passed to --disable.
-        #[structopt(long="enable")]
-        enable: Vec<String>,
+        #[structopt(long="enable", default_value="")]
+        enable: String,
 
         /// Disable render-passes, or "all" to only use those passed to --enable.
-        #[structopt(long="disable")]
-        disable: Vec<String>,
+        #[structopt(long="disable", default_value="")]
+        disable: String,
 
         /// Run output through pngcrush automatically. Requires pngcrush to be installed.
         #[structopt(long="pngcrush")]
@@ -114,6 +118,16 @@ enum Command {
     DiffMaps {
         left: String,
         right: String,
+    },
+    /// Show metadata information about the map.
+    #[structopt(name="map-info")]
+    MapInfo {
+        /// Output as JSON.
+        #[structopt(short="j", long="json")]
+        json: bool,
+
+        /// The list of maps to show info on.
+        files: Vec<String>,
     },
 }
 
@@ -157,8 +171,9 @@ fn run(opt: &Opt, command: &Command, context: &mut Context) {
                         grid: map.z_level(z),
                         min: (min.x - 1, min.y - 1),
                         max: (max.x - 1, max.y - 1),
+                        render_passes: &render_passes,
                     };
-                    let image = minimap::generate(minimap_context, &mut context.icon_cache, &render_passes).unwrap();
+                    let image = minimap::generate(minimap_context, &mut context.icon_cache).unwrap();
                     let outfile = format!("{}/{}-{}.png", output, path.file_stem().unwrap().to_string_lossy(), 1 + z);
                     println!("    saving {}", outfile);
                     image.to_file(outfile.as_ref()).unwrap();
@@ -230,7 +245,39 @@ fn run(opt: &Opt, command: &Command, context: &mut Context) {
                     }
                 }
             }
-        }
+        },
+        // --------------------------------------------------------------------
+        Command::MapInfo {
+            json, ref files,
+        } => {
+            if !json {
+                println!("non-JSON output is not yet supported");
+            }
+
+            #[derive(Serialize)]
+            struct Map {
+                size: (usize, usize, usize),
+                key_length: u8,
+                num_keys: usize,
+            }
+
+            let mut report = HashMap::new();
+            for path in files.iter() {
+                let path: &std::path::Path = path.as_ref();
+                let mut map = dmm::Map::from_file(path).unwrap();
+
+                let dim = map.grid.dim();
+                report.insert(path, Map {
+                    size: (dim.2, dim.1, dim.0),  // zyx -> xyz
+                    key_length: map.key_length,
+                    num_keys: map.dictionary.len(),
+                });
+            }
+
+            let stdout = std::io::stdout();
+            serde_json::to_writer(stdout.lock(), &report).unwrap();
+            println!();
+        },
         // --------------------------------------------------------------------
     }
 }
