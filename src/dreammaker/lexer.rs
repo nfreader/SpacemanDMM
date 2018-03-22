@@ -1,9 +1,9 @@
 //! The lexer/tokenizer.
-use std::io::{Read, Bytes};
+use std::io;
 use std::str::FromStr;
 use std::fmt;
 
-use super::{DMError, Location, HasLocation};
+use super::{DMError, Location, HasLocation, FileId, Context};
 
 macro_rules! table {
     ($(#[$attr:meta])* table $tabname:ident: $repr:ty => $enum_:ident; $($literal:expr, $name:ident;)*) => {
@@ -168,10 +168,14 @@ impl Token {
         match (prev, self) {
             (&Token::Ident(_, true), _) |
             (&Token::Punct(Comma), _) => true,
-            (&Token::Ident(_, _), &Token::Punct(_)) |
-            (&Token::Ident(_, _), &Token::InterpStringEnd(_)) |
-            (&Token::Ident(_, _), &Token::InterpStringPart(_)) => false,
-            (&Token::Ident(_, _), _) => true,
+            (&Token::Ident(..), &Token::Punct(_)) |
+            (&Token::Ident(..), &Token::InterpStringEnd(_)) |
+            (&Token::Ident(..), &Token::InterpStringPart(_)) |
+            (&Token::Punct(_), &Token::Ident(..)) |
+            (&Token::InterpStringBegin(_), &Token::Ident(..)) |
+            (&Token::InterpStringPart(_), &Token::Ident(..)) => false,
+            (&Token::Ident(..), _) |
+            (_, &Token::Ident(..)) => true,
             _ => false,
         }
     }
@@ -182,7 +186,6 @@ impl fmt::Display for Token {
         use self::Token::*;
         match *self {
             Eof => f.write_str("__EOF__"),
-            Punct(Punctuation::Tab) => f.write_str("    "),
             Punct(p) => f.write_str(::std::str::from_utf8(p.value()).unwrap()),
             Ident(ref i, _) => f.write_str(i),
             String(ref i) => write!(f, "\"{}\"", i),
@@ -218,6 +221,14 @@ fn is_ident(ch: u8) -> bool {
     (ch >= b'a' && ch <= b'z') || (ch >= b'A' && ch <= b'Z') || ch == b'_'
 }
 
+fn from_latin1(bytes: &[u8]) -> String {
+    let mut output = String::new();
+    for &byte in bytes {
+        output.push(byte as char);
+    }
+    output
+}
+
 // Used to track nested string interpolations and know when they end.
 #[derive(Debug)]
 struct Interpolation {
@@ -236,60 +247,79 @@ enum Directive {
 
 /// The lexer, which serves as a source of tokens through iteration.
 #[derive(Debug)]
-pub struct Lexer<R: Read> {
+pub struct Lexer<'ctx, I> {
+    context: &'ctx Context,
+    input: I,
     next: Option<u8>,
-    input: Bytes<R>,
+    /// The location of the last character returned by `next()`.
     location: Location,
     at_line_head: bool,
+    at_line_end: bool,
     directive: Directive,
     interp_stack: Vec<Interpolation>,
 }
 
-impl<R: Read> HasLocation for Lexer<R> {
+impl<'ctx, I: Iterator<Item=io::Result<u8>>> HasLocation for Lexer<'ctx, I> {
     fn location(&self) -> Location {
         self.location
     }
 }
 
-impl<R: Read> Lexer<R> {
+impl<'ctx, R: io::Read> Lexer<'ctx, io::Bytes<R>> {
+    /// Create a new lexer from a reader.
+    pub fn from_read(context: &'ctx Context, file_number: FileId, source: R) -> Lexer<io::Bytes<R>> {
+        Lexer::new(context, file_number, source.bytes())
+    }
+}
+
+impl<'ctx, I: Iterator<Item=io::Result<u8>>> Lexer<'ctx, I> {
     /// Create a new lexer from a byte stream.
-    pub fn new(file_number: u32, source: R) -> Lexer<R> {
+    pub fn new(context: &'ctx Context, file_number: FileId, input: I) -> Lexer<I> {
         Lexer {
+            context,
+            input,
             next: None,
-            input: source.bytes(),
             location: Location {
                 file: file_number,
                 line: 1,
-                column: 1,
+                column: 0,
             },
             at_line_head: true,
+            at_line_end: false,
             directive: Directive::None,
             interp_stack: Vec::new(),
         }
     }
 
-    fn next(&mut self) -> Result<Option<u8>, DMError> {
+    fn next(&mut self) -> Option<u8> {
         if let Some(next) = self.next.take() {
-            return Ok(Some(next));
+            return Some(next);
         }
+
+        if self.at_line_end {
+            self.at_line_end = false;
+            self.at_line_head = true;
+            self.location.line += 1;
+            self.location.column = 0;
+            self.directive = Directive::None;
+        }
+
         match self.input.next() {
             Some(Ok(ch)) => {
                 if ch == b'\n' {
-                    self.location.line += 1;
-                    self.location.column = 1;
-                    self.at_line_head = true;
-                    self.directive = Directive::None;
-                } else {
-                    if ch != b'\t' && ch != b' ' && self.at_line_head {
-                        self.at_line_head = false;
-                    }
-                    self.location.column += 1;
+                    self.at_line_end = true;
+                } else if ch != b'\t' && ch != b' ' && self.at_line_head {
+                    self.at_line_head = false;
                 }
-
-                Ok(Some(ch))
+                self.location.column += 1;
+                Some(ch)
             }
-            Some(Err(_)) => Err(self.error("i/o error")), // TODO
-            None => Ok(None),
+            Some(Err(err)) => {
+                // I/O error is effectively EOF.
+                self.context.register_error(self.error("i/o error").set_cause(err));
+                None
+            }
+            None => None,
         }
     }
 
@@ -300,30 +330,44 @@ impl<R: Read> Lexer<R> {
         self.next = val;
     }
 
-    fn skip_until(&mut self, end: &[u8]) -> Result<(), DMError> {
-        let mut idx = 0;
-        while let Some(ch) = self.next()? {
-            if ch == end[idx] {
-                idx += 1;
-                if idx == end.len() {
-                    return Ok(())
+    fn skip_block_comments(&mut self) {
+        let mut depth = 1;
+        let mut buffer = [0, 0];
+        while depth > 0 {
+            // read one character
+            buffer[0] = buffer[1];
+            match self.next() {
+                Some(val) => buffer[1] = val,
+                None => {
+                    self.context.register_error(self.error("still skipping comments at end of file"));
+                    break;
                 }
-            } else if ch == end[0] {
-                // TODO: this is a hack to fix the '**/' situation
-                idx = 1;
-            } else {
-                idx = 0;
             }
-        }
-        if end == b"\n" {
-            // closed by the implicit newline at the end of the file
-            Ok(())
-        } else {
-            Err(self.error("still skipping comments at end of file"))
+
+            if buffer == *b"/*" {
+                depth += 1;
+            } else if buffer == *b"*/" {
+                depth -= 1;
+            }
         }
     }
 
-    fn read_number_inner(&mut self, first: u8) -> Result<(bool, u32, String), DMError> {
+    fn skip_line_comment(&mut self) {
+        let mut backslash = false;
+        while let Some(ch) = self.next() {
+            if ch == b'\r' {
+                // not listening
+            } else if backslash {
+                backslash = false;
+            } else if ch == b'\n' {
+                break
+            } else if ch == b'\\' {
+                backslash = true;
+            }
+        }
+    }
+
+    fn read_number_inner(&mut self, first: u8) -> (bool, u32, String) {
         let mut integer = true;
         let mut exponent = false;
         let mut radix = 10;
@@ -333,14 +377,14 @@ impl<R: Read> Lexer<R> {
         if first == b'.' {
             integer = false;
         } else if first == b'0' {
-            radix = 8; // hate. let me tell you...
-            match self.next()? {
+            radix = 8;  // hate. let me tell you...
+            match self.next() {
                 Some(b'x') => radix = 16,
                 ch => self.put_back(ch),
             }
         }
         loop {
-            match self.next()? {
+            match self.next() {
                 Some(b'_') => {},
                 Some(ch) if ch == b'.' || ch == b'e' => {
                     integer = false;
@@ -350,72 +394,82 @@ impl<R: Read> Lexer<R> {
                 Some(ch) if (ch == b'+' || ch == b'-') && exponent => {
                     buf.push(ch as char);
                 }
-                Some(b'#') => {
-                    let (i, n, f) = (self.next()?, self.next()?, self.next()?);
-                    if i == Some(b'I') && n == Some(b'N') && f == Some(b'F') {
-                        return Ok((false, 10, "inf".to_owned()));
-                    } else {
-                        return Err(self.error("expected INF"));
+                Some(b'#') if !integer => {
+                    buf.push('#');  // Keep pushing to `buf` in case of error.
+                    for &expect in b"INF" {
+                        match self.next() {
+                            Some(ch) if ch == expect => continue,
+                            Some(ch) => buf.push(ch as char),
+                            None => {}
+                        }
+                        // Not what we expected, throw it up the line so that
+                        // f32::from_str will error.
+                        return (false, 10, buf);
                     }
+                    // Got "1.#INF", change it to "inf" for read_number.
+                    return (false, 10, "inf".to_owned());
                 }
-                Some(ch) if is_digit(ch) => buf.push(ch as char),
-                ch => { self.put_back(ch); return Ok((integer, radix, buf)) }
+                Some(ch) if (ch as char).is_digit(::std::cmp::max(radix, 10)) => buf.push(ch as char),
+                ch => {
+                    self.put_back(ch);
+                    return (integer, radix, buf);
+                }
             }
         }
     }
 
-    fn read_number(&mut self, first: u8) -> Result<Token, DMError> {
-        let (integer, radix, buf) = self.read_number_inner(first)?;
+    fn read_number(&mut self, first: u8) -> Token {
+        let (integer, radix, buf) = self.read_number_inner(first);
         if integer {
             match i32::from_str_radix(&buf, radix) {
-                Ok(val) => Ok(Token::Int(val)),
-                Err(_) => Err(self.error(format!("bad base-{} integer: {}", radix, buf))), // TODO
+                Ok(val) => Token::Int(val),
+                Err(e) => {
+                    self.context.register_error(self.error(
+                        format!("bad base-{} integer \"{}\": {}", radix, buf, e)));
+                    Token::Int(0)  // fallback
+                }
             }
         } else {
             // ignore radix
             match f32::from_str(&buf) {
-                Ok(val) => Ok(Token::Float(val)),
-                Err(_) => Err(self.error(format!("bad float: {}", buf))), // TODO
+                Ok(val) => Token::Float(val),
+                Err(e) => {
+                    self.context.register_error(self.error(
+                        format!("bad float \"{}\": {}", buf, e)));
+                    Token::Float(0.0)  // fallback
+                }
             }
         }
     }
 
-    fn read_ident(&mut self, first: u8) -> Result<String, DMError> {
+    fn read_ident(&mut self, first: u8) -> String {
         let mut ident = vec![first];
         loop {
-            match self.next()? {
+            match self.next() {
                 Some(ch) if is_ident(ch) || is_digit(ch) => ident.push(ch),
                 ch => { self.put_back(ch); break }
             }
         }
-        String::from_utf8(ident).map_err(|_| self.error("non-utf8 identifier")) // TODO
+        from_latin1(&ident)
     }
 
-    fn next_string(&mut self, start_loc: Location) -> Result<u8, DMError> {
-        match self.next() {
-            Ok(Some(ch)) => Ok(ch),
-            Ok(None) => Err(DMError::new(start_loc, "unterminated string")),
-            Err(e) => Err(e),
-        }
-    }
-
-    fn read_resource(&mut self) -> Result<String, DMError> {
+    fn read_resource(&mut self) -> String {
         let start_loc = self.location();
         let mut buf = Vec::new();
-
         loop {
-            let ch = self.next_string(start_loc)?;
-            if ch == b'\'' {
-                break;
-            } else {
-                buf.push(ch);
+            match self.next() {
+                Some(b'\'') => break,
+                Some(ch) => buf.push(ch),
+                None => {
+                    self.context.register_error(DMError::new(start_loc, "unterminated resource literal"));
+                    break;
+                }
             }
         }
-
-        String::from_utf8(buf).map_err(|_| self.error("non-utf8 string")) // TODO
+        from_latin1(&buf)
     }
 
-    fn read_string(&mut self, end: &'static [u8], interp_closed: bool) -> Result<Token, DMError> {
+    fn read_string(&mut self, end: &'static [u8], interp_closed: bool) -> Token {
         let start_loc = self.location();
         let mut buf = Vec::new();
         let mut backslash = false;
@@ -423,7 +477,13 @@ impl<R: Read> Lexer<R> {
         let mut interp_opened = false;
 
         loop {
-            let ch = self.next_string(start_loc)?;
+            let ch = match self.next() {
+                Some(ch) => ch,
+                None => {
+                    self.context.register_error(DMError::new(start_loc, "unterminated string literal"));
+                    break;
+                }
+            };
             if ch == end[idx] && !backslash {
                 idx += 1;
                 if idx == end.len() {
@@ -441,8 +501,8 @@ impl<R: Read> Lexer<R> {
             match ch {
                 b'\r' | b'\n' if backslash => {
                     backslash = false;
-                    let next = self.skip_ws(true)?;
-                    self.put_back(next)
+                    let next = self.skip_ws(true);
+                    self.put_back(next);
                 },
                 /*b'"' | b'\'' | b'\\' | b'[' | b']' if backslash => {
                     backslash = false;
@@ -467,27 +527,25 @@ impl<R: Read> Lexer<R> {
                 ch => buf.push(ch),
             }
         }
-        let string = match String::from_utf8(buf) {
-            Ok(s) => s,
-            Err(_) => return Err(self.error("non-utf8 string")), // TODO
-        };
-        Ok(match (interp_opened, interp_closed) {
+
+        let string = from_latin1(&buf);
+        match (interp_opened, interp_closed) {
             (true, true) => Token::InterpStringPart(string),
             (true, false) => Token::InterpStringBegin(string),
             (false, true) => Token::InterpStringEnd(string),
             (false, false) => Token::String(string),
-        })
+        }
     }
 
-    fn read_punct(&mut self, first: u8) -> Result<Option<Punctuation>, DMError> {
+    fn read_punct(&mut self, first: u8) -> Option<Punctuation> {
         // requires that PUNCT_TABLE be ordered, shorter entries be first,
         // and all entries with >1 character also have their prefix in the table
         let mut items: Vec<_> = PUNCT_TABLE.iter()
             .skip_while(|&&(tok, _)| tok[0] != first)
             .take_while(|&&(tok, _)| tok[0] == first)
             .collect();
-        if items.len() == 0 {
-            return Ok(None)
+        if items.is_empty() {
+            return None
         }
 
         let mut candidate;
@@ -495,57 +553,58 @@ impl<R: Read> Lexer<R> {
         loop {
             candidate = Some(items[0].1);
             if items.len() == 1 {
-                return Ok(candidate)
+                return candidate
             }
-            match self.next()? {
+            match self.next() {
                 Some(b) => needle.push(b),
-                None => return Ok(candidate), // EOF
+                None => return candidate,  // EOF
             }
             items.retain(|&&(tok, _)| tok.starts_with(&needle));
-            if items.len() == 0 {
+            if items.is_empty() {
                 self.put_back(needle.last().cloned());
-                return Ok(candidate)
+                return candidate
             }
         }
     }
 
-    fn skip_ws(&mut self, skip_newlines: bool) -> Result<Option<u8>, DMError> {
+    fn skip_ws(&mut self, skip_newlines: bool) -> Option<u8> {
         let mut skip_newlines = if skip_newlines { 2 } else { 0 };
         loop {
-            match self.next()? {
+            match self.next() {
                 Some(b'\r') => {},
                 Some(b' ') |
                 Some(b'\t') if !self.at_line_head || skip_newlines > 0 => {},
                 Some(b'\n') if skip_newlines == 2 => { skip_newlines = 1; },
-                ch => return Ok(ch)
+                ch => return ch
             }
         }
     }
 }
 
-impl<R: Read> Iterator for Lexer<R> {
-    type Item = Result<LocatedToken, DMError>;
+impl<'ctx, I: Iterator<Item=io::Result<u8>>> Iterator for Lexer<'ctx, I> {
+    type Item = LocatedToken;
 
-    fn next(&mut self) -> Option<Result<LocatedToken, DMError>> {
+    fn next(&mut self) -> Option<LocatedToken> {
         use self::Token::*;
         use self::Punctuation::*;
         let mut skip_newlines = false;
+        let mut found_illegal = false;
         loop {
             let first = match self.skip_ws(skip_newlines) {
-                Ok(Some(t)) => t,
-                Ok(None) => {
+                Some(t) => t,
+                None => {
                     // always end with a newline
                     if !self.at_line_head {
                         self.at_line_head = true;
-                        return Some(Ok(LocatedToken {
+                        self.location.column += 1;
+                        return Some(LocatedToken {
                             location: self.location(),
                             token: Token::Punct(Punctuation::Newline),
-                        }))
+                        })
                     } else {
                         return None;
                     }
                 }
-                Err(e) => return Some(Err(e)),
             };
             skip_newlines = false;
 
@@ -555,51 +614,48 @@ impl<R: Read> Iterator for Lexer<R> {
             if self.directive == Directive::Stringy {
                 self.directive = Directive::None;
                 self.put_back(Some(first));
-                return Some(self.read_string(b"\n", false).map(locate));
+                return Some(locate(self.read_string(b"\n", false)));
             }
 
-            let punct = try_iter!(self.read_punct(first));
+            let punct = self.read_punct(first);
             return match punct {
                 Some(Hash) if self.directive == Directive::None => {
                     self.directive = Directive::Hash;
-                    Some(Ok(locate(Punct(Hash))))
+                    Some(locate(Punct(Hash)))
                 }
                 Some(BlockComment) => {
-                    try_iter!(self.skip_until(b"*/"));
+                    self.skip_block_comments();
                     continue;
                 }
                 Some(LineComment) => {
-                    try_iter!(self.skip_until(b"\n"));
-                    Some(Ok(locate(Punct(Newline))))
+                    self.skip_line_comment();
+                    Some(locate(Punct(Newline)))
                 }
-                Some(SingleQuote) => Some(self.read_resource().map(|s| locate(Resource(s)))),
-                Some(DoubleQuote) => Some(self.read_string(b"\"", false).map(locate)),
-                Some(BlockString) => Some(self.read_string(b"\"}", false).map(locate)),
+                Some(SingleQuote) => Some(locate(Resource(self.read_resource()))),
+                Some(DoubleQuote) => Some(locate(self.read_string(b"\"", false))),
+                Some(BlockString) => Some(locate(self.read_string(b"\"}", false))),
                 Some(LBracket) => {
                     if let Some(interp) = self.interp_stack.last_mut() {
                         interp.bracket_depth += 1;
                     }
-                    Some(Ok(locate(Punct(LBracket))))
+                    Some(locate(Punct(LBracket)))
                 }
                 Some(RBracket) => {
                     if let Some(mut interp) = self.interp_stack.pop() {
                         interp.bracket_depth -= 1;
                         if interp.bracket_depth == 0 {
-                            return Some(self.read_string(interp.end, true).map(locate));
+                            return Some(locate(self.read_string(interp.end, true)));
                         }
                         self.interp_stack.push(interp);
                     }
-                    Some(Ok(locate(Punct(RBracket))))
+                    Some(locate(Punct(RBracket)))
                 }
-                Some(v) => Some(Ok(locate(Punct(v)))),
+                Some(v) => Some(locate(Punct(v))),
                 None => match first {
-                    b'0'...b'9' => Some(self.read_number(first).map(|n| locate(n))),
+                    b'0'...b'9' => Some(locate(self.read_number(first))),
                     b'_' | b'a'...b'z' | b'A'...b'Z' => {
-                        let ident = match self.read_ident(first) {
-                            Ok(ident) => ident,
-                            Err(e) => return Some(Err(e)),
-                        };
-                        let next = try_iter!(self.next());
+                        let ident = self.read_ident(first);
+                        let next = self.next();
                         self.put_back(next);
                         let ws = next == Some(b' ') || next == Some(b'\t');
                         if self.directive == Directive::Hash {
@@ -609,31 +665,22 @@ impl<R: Read> Iterator for Lexer<R> {
                                 self.directive = Directive::Ordinary;
                             }
                         }
-                        Some(Ok(locate(Ident(ident, ws))))
+                        Some(locate(Ident(ident, ws)))
                     }
                     b'\\' => {
                         self.at_line_head = false;
                         skip_newlines = true;
                         continue;
                     }
-                    _ => Some(Err(self.error(format!("illegal byte '{}' (0x{:x})", first as char, first))))
+                    _ => {
+                        if !found_illegal {
+                            self.context.register_error(self.error(format!("illegal byte 0x{:x}", first)));
+                            found_illegal = true;
+                        }
+                        continue;
+                    }
                 }
             }
         }
     }
-}
-
-#[cfg(test)]
-fn lex(f: &str) -> Vec<Token> {
-    Lexer::new(0, f.as_bytes()).map(|x| x.map(|y| y.token)).collect::<Result<Vec<_>, _>>().unwrap()
-}
-
-#[test]
-fn floats() {
-    assert_eq!(lex("0.08"), vec![Token::Float(0.08)]);
-}
-
-#[test]
-fn nested_interpolation() {
-    println!("{:?}", lex(r#""A[B"C"D]E""#));
 }

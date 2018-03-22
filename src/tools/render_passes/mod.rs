@@ -2,12 +2,16 @@ use dm::objtree::*;
 use dm::constants::Constant;
 use minimap::Atom;
 
+pub mod transit_tube;
+pub mod random;
+pub mod structures;
+
 /// A map rendering pass.
 ///
 /// These methods are applied to any given atom in roughly the order they
 /// appear here.
 #[allow(unused_variables)]
-pub trait RenderPass {
+pub trait RenderPass: Sync {
     /// Filter atoms based solely on their typepath.
     fn path_filter(&self,
         path: &str,
@@ -74,10 +78,12 @@ pub const RENDER_PASSES: &[RenderPassInfo] = &[
     pass!(HideSpace, "hide-space", "Do not render space tiles, instead leaving transparency.", true),
     pass!(HideAreas, "hide-areas", "Do not render area icons.", true),
     pass!(HideInvisible, "hide-invisible", "Do not render invisible or ephemeral objects such as mapping helpers.", true),
-    pass!(Random, "random", "Replace random spawners with one of their possibilities.", true),
+    pass!(random::Random, "random", "Replace random spawners with one of their possibilities.", true),
     pass!(Pretty, "pretty", "Add the minor cosmetic overlays for various objects.", true),
-    pass!(Spawners, "spawners", "Replace object spawners with their spawned objects.", true),
-    pass!(TransitTube, "transit-tube", "Add overlays to connect transit tubes together.", true),
+    pass!(structures::Spawners, "spawners", "Replace object spawners with their spawned objects.", true),
+    pass!(FakeGlass, "fake-glass", "Add underlays to fake glass turfs.", true),
+    pass!(transit_tube::TransitTube, "transit-tube", "Add overlays to connect transit tubes together.", true),
+    pass!(structures::GravityGen, "gravity-gen", "Expand the gravity generator to the full structure.", true),
 ];
 
 pub fn configure(include: &str, exclude: &str) -> Vec<Box<RenderPass>> {
@@ -115,6 +121,19 @@ fn add_to<'a, S: Into<String>>(target: &mut Vec<Atom<'a>>, atom: &Atom<'a>, icon
 #[derive(Default)]
 pub struct HideSpace;
 impl RenderPass for HideSpace {
+    fn expand<'a>(&self,
+        atom: &Atom<'a>,
+        objtree: &'a ObjectTree,
+        output: &mut Vec<Atom<'a>>,
+    ) -> bool {
+        if atom.istype("/turf/template_noop/") {
+            output.push(Atom::from_type(objtree, "/turf/open/space", atom.loc).unwrap());
+            true
+        } else {
+            false
+        }
+    }
+
     fn late_filter(&self, atom: &Atom, _: &ObjectTree) -> bool {
         !atom.istype("/turf/open/space/")
     }
@@ -133,7 +152,9 @@ pub struct HideInvisible;
 impl RenderPass for HideInvisible {
     fn early_filter(&self, atom: &Atom, objtree: &ObjectTree) -> bool {
         // invisible objects and syndicate balloons are not to show
-        if atom.get_var("invisibility", objtree).to_float().unwrap_or(0.) > 60. {
+        if atom.get_var("invisibility", objtree).to_float().unwrap_or(0.) > 60. ||
+            atom.istype("/obj/effect/mapping_helpers/")
+        {
             return false;
         }
         if atom.get_var("icon", objtree).eq_resource("icons/obj/items_and_weapons.dmi") &&
@@ -147,88 +168,23 @@ impl RenderPass for HideInvisible {
 }
 
 #[derive(Default)]
-pub struct Spawners;
-impl RenderPass for Spawners {
-    fn path_filter(&self, path: &str) -> bool {
-        subpath(path, "/obj/effect/spawner/structure/") || !subpath(path, "/obj/effect/spawner/")
-    }
-
-    fn expand<'a>(&self,
-        atom: &Atom<'a>,
-        objtree: &'a ObjectTree,
-        output: &mut Vec<Atom<'a>>,
-    ) -> bool {
-        if !atom.istype("/obj/effect/spawner/structure/") {
-            return false;
-        }
-        match atom.get_var("spawn_list", objtree) {
-            &Constant::List(ref elements) => {
-                for &(ref key, _) in elements {
-                    // TODO: use a more civilized lookup method
-                    let mut type_key = String::new();
-                    let reference;
-                    match key {
-                        &Constant::String(ref s) => reference = s,
-                        &Constant::Prefab(ref fab) => {
-                            for each in fab.path.iter() {
-                                use std::fmt::Write;
-                                let _ = write!(type_key, "{}{}", each.0, each.1);
-                            }
-                            reference = &type_key;
-                        }
-                        _ => continue,
-                    }
-                    output.push(Atom::from_type(objtree, reference, atom.loc).unwrap());
-                }
-                true  // don't include the original atom
-            }
-            _ => { false }  // TODO: complain?
-        }
-    }
-}
-
-#[derive(Default)]
-pub struct Random;
-impl RenderPass for Random {
-    fn adjust_vars<'a>(&self,
+pub struct FakeGlass;
+impl RenderPass for FakeGlass {
+    fn overlays<'a>(&self,
         atom: &mut Atom<'a>,
-        objtree: &'a ObjectTree,
+        _objtree: &'a ObjectTree,
+        underlays: &mut Vec<Atom<'a>>,
+        _overlays: &mut Vec<Atom<'a>>,
     ) {
-        use rand::Rng;
-
-        const CONTRABAND_POSTERS: u32 = 44;
-        const LEGIT_POSTERS: u32 = 35;
-
-        if atom.istype("/obj/structure/sign/poster/contraband/random/") {
-            atom.set_var("icon_state", Constant::string(format!("poster{}", ::rand::thread_rng().gen_range(1, 1 + CONTRABAND_POSTERS))));
-        } else if atom.istype("/obj/structure/sign/poster/official/random/") {
-            atom.set_var("icon_state", Constant::string(format!("poster{}_legit", ::rand::thread_rng().gen_range(1, 1 + LEGIT_POSTERS))));
-        } else if atom.istype("/obj/structure/sign/poster/random/") {
-            let i = 1 + ::rand::thread_rng().gen_range(0, CONTRABAND_POSTERS + LEGIT_POSTERS);
-            if i <= CONTRABAND_POSTERS {
-                atom.set_var("icon_state", Constant::string(format!("poster{}", i)));
-            } else {
-                atom.set_var("icon_state", Constant::string(format!("poster{}_legit", i - CONTRABAND_POSTERS)));
-            }
-        } else if atom.istype("/obj/structure/sign/barsign/") {
-            if let Some(root) = objtree.find("/datum/barsign") {
-                let mut signs = Vec::new();
-                for child in root.children(objtree) {
-                    if let Some(v) = child.vars.get("hidden") {
-                        if !v.value.constant.as_ref().map_or(false, |c| c.to_bool()) {
-                            continue
-                        }
-                    }
-                    if let Some(icon) = child.vars.get("icon") {
-                        if let Some(c) = icon.value.constant.as_ref() {
-                            signs.push(c.clone());
-                        }
-                    }
-                }
-                if let Some(c) = ::rand::thread_rng().choose(&signs) {
-                    atom.set_var("icon_state", c.clone());
-                }
-            }
+        if atom.istype("/turf/closed/indestructible/fakeglass/") {
+            let mut copy = atom.clone();
+            copy.set_var("icon", Constant::string("icons/turf/floors.dmi"));
+            copy.set_var("icon_state", Constant::string("plating"));
+            underlays.push(copy);
+            copy = atom.clone();
+            copy.set_var("icon", Constant::string("icons/obj/structures.dmi"));
+            copy.set_var("icon_state", Constant::string("grille"));
+            underlays.push(copy);
         }
     }
 }
@@ -275,121 +231,4 @@ impl RenderPass for Pretty {
             }
         }
     }
-}
-
-#[derive(Default)]
-pub struct TransitTube;
-impl RenderPass for TransitTube {
-    fn overlays<'a>(&self,
-        atom: &mut Atom<'a>,
-        objtree: &'a ObjectTree,
-        _: &mut Vec<Atom<'a>>,
-        overlays: &mut Vec<Atom<'a>>,
-    ) {
-        use dmi::*;
-
-        if !atom.istype("/obj/structure/transit_tube/") {
-            return
-        }
-
-        let dir = atom.get_var("dir", objtree).to_int().unwrap_or(::dmi::SOUTH);
-        let mut fulfill = |items: &[i32]| {
-            for &dir in items {
-                if dir == NORTHEAST || dir == NORTHWEST || dir == SOUTHEAST || dir == SOUTHWEST {
-                    if dir & NORTH != 0 {
-                        create_tube_overlay(overlays, objtree, atom, dir ^ 3, NORTH);
-                        if dir & EAST != 0 {
-                            create_tube_overlay(overlays, objtree, atom, dir ^ 12, EAST);
-                        } else {
-                            create_tube_overlay(overlays, objtree, atom, dir ^ 12, WEST);
-                        }
-                    }
-                } else {
-                    create_tube_overlay(overlays, objtree, atom, dir, 0);
-                }
-            }
-        };
-
-        if atom.istype("/obj/structure/transit_tube/station/reverse/") {
-            fulfill(&match dir {
-                NORTH => [EAST],
-                SOUTH => [WEST],
-                EAST => [SOUTH],
-                WEST => [NORTH],
-                _ => return,
-            })
-        } else if atom.istype("/obj/structure/transit_tube/station/") {
-            fulfill(&match dir {
-                NORTH | SOUTH => [EAST, WEST],
-                EAST | WEST => [NORTH, SOUTH],
-                _ => return,
-            })
-        } else if atom.istype("/obj/structure/transit_tube/junction/flipped/") {
-            fulfill(&match dir {
-                NORTH => [NORTH, SOUTHWEST, SOUTHEAST],
-                SOUTH => [SOUTH, NORTHEAST, NORTHWEST],
-                EAST => [EAST, NORTHWEST, SOUTHWEST],
-                WEST => [WEST, SOUTHEAST, NORTHEAST],
-                _ => return,
-            })
-        } else if atom.istype("/obj/structure/transit_tube/junction/") {
-            fulfill(&match dir {
-                NORTH => [NORTH, SOUTHEAST, SOUTHWEST],
-                SOUTH => [SOUTH, NORTHWEST, NORTHEAST],
-                EAST => [EAST, SOUTHWEST, NORTHWEST],
-                WEST => [WEST, NORTHEAST, SOUTHEAST],
-                _ => return,
-            })
-        } else if atom.istype("/obj/structure/transit_tube/curved/flipped/") {
-            fulfill(&match dir {
-                NORTH => [NORTH, SOUTHEAST],
-                SOUTH => [SOUTH, NORTHWEST],
-                EAST => [EAST, SOUTHWEST],
-                WEST => [NORTHEAST, WEST],
-                _ => return,
-            })
-        } else if atom.istype("/obj/structure/transit_tube/curved/") {
-            fulfill(&match dir {
-                NORTH => [NORTH, SOUTHWEST],
-                SOUTH => [SOUTH, NORTHEAST],
-                EAST => [EAST, NORTHWEST],
-                WEST => [SOUTHEAST, WEST],
-                _ => return,
-            })
-        } else if atom.istype("/obj/structure/transit_tube/diagonal/") {
-            fulfill(&match dir {
-                NORTH | SOUTH => [NORTHEAST, SOUTHWEST],
-                EAST | WEST => [NORTHWEST, SOUTHEAST],
-                _ => return,
-            })
-        } else {
-            fulfill(&match dir {
-                NORTH | SOUTH => [NORTH, SOUTH],
-                EAST | WEST => [EAST, WEST],
-                _ => return,
-            })
-        }
-    }
-}
-
-fn create_tube_overlay<'a>(output: &mut Vec<Atom<'a>>, objtree: &'a ObjectTree, source: &Atom<'a>, dir: i32, shift: i32) {
-    use dmi::*;
-
-    let mut copy = Atom::from_type(objtree, "/atom", source.loc).unwrap();
-    copy.set_var("dir", Constant::Int(dir));
-    copy.copy_var("layer", source, objtree);
-    copy.copy_var("icon", source, objtree);
-    if shift != 0 {
-        copy.set_var("icon_state", Constant::string("decorative_diag"));
-        match shift {
-            NORTH => copy.set_var("pixel_y", Constant::Int(32)),
-            SOUTH => copy.set_var("pixel_y", Constant::Int(-32)),
-            EAST => copy.set_var("pixel_x", Constant::Int(32)),
-            WEST => copy.set_var("pixel_x", Constant::Int(-32)),
-            _ => {}
-        }
-    } else {
-        copy.set_var("icon_state", Constant::string("decorative"));
-    }
-    output.push(copy);
 }

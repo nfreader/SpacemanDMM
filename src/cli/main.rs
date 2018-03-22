@@ -1,5 +1,6 @@
 //! CLI tools, including a map renderer, using the same backend as the editor.
 
+extern crate rayon;
 extern crate structopt;
 #[macro_use] extern crate structopt_derive;
 
@@ -11,14 +12,14 @@ extern crate dreammaker as dm;
 #[macro_use] extern crate dmm_tools;
 
 use std::fmt;
-use std::path::PathBuf;
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicIsize, Ordering};
+use std::path::Path;
 
 use structopt::StructOpt;
 
 use dm::objtree::ObjectTree;
 use dmm_tools::*;
-use dmm_tools::dmi::IconFile;
 
 // ----------------------------------------------------------------------------
 // Main driver
@@ -26,25 +27,48 @@ use dmm_tools::dmi::IconFile;
 fn main() {
     let opt = Opt::from_args();
     let mut context = Context::default();
+    rayon::ThreadPoolBuilder::new()
+        .num_threads(opt.jobs)
+        .build_global()
+        .expect("failed to initialize thread pool");
+    context.parallel = opt.jobs != 1;
+
     run(&opt, &opt.command, &mut context);
 
     #[cfg(feature="flame")] {
         println!("Saving flame graph");
         flame::dump_html(&mut std::io::BufWriter::new(std::fs::File::create(format!("{}/flame-graph.html", opt.output)).unwrap())).unwrap();
     }
+
+    std::process::exit(context.exit_status.into_inner() as i32);
 }
 
 #[derive(Default)]
 struct Context {
+    dm_context: dm::Context,
     objtree: ObjectTree,
-    icon_cache: HashMap<PathBuf, IconFile>,
+    icon_cache: icon_cache::IconCache,
+    exit_status: AtomicIsize,
+    parallel: bool,
 }
 
 impl Context {
     fn objtree(&mut self, opt: &Opt) {
         println!("parsing {}", opt.environment);
         flame!("parse");
-        self.objtree = dm::parse_environment(opt.environment.as_ref()).unwrap();
+        match self.dm_context.parse_environment(opt.environment.as_ref()) {
+            Ok(tree) => {
+                self.objtree = tree;
+                self.dm_context.print_all_errors();
+                if !self.dm_context.errors().is_empty() {
+                    println!("there were some parsing errors; render may be inaccurate")
+                }
+            },
+            Err(e) => {
+                eprintln!("i/o error opening environment:\n{}", e);
+                std::process::exit(1);
+            }
+        };
     }
 }
 
@@ -57,6 +81,11 @@ struct Opt {
     #[structopt(short="v", long="verbose")]
     verbose: bool,
 
+    /// Set the number of threads to be used for parallel execution when
+    /// possible. A value of 0 will select automatically, and 1 will be serial.
+    #[structopt(long="jobs", default_value="1")]
+    jobs: usize,
+
     #[structopt(subcommand)]
     command: Command,
 }
@@ -68,7 +97,19 @@ struct Opt {
 enum Command {
     /// Show information about the render-pass list.
     #[structopt(name = "list-passes")]
-    ListPasses,
+    ListPasses {
+        /// Output as JSON.
+        #[structopt(short="j", long="json")]
+        json: bool,
+    },
+    /// Dump the object tree to an XML file.
+    #[cfg(feature="xml")]
+    #[structopt(name = "objtree")]
+    ObjectTree {
+        /// The output filename.
+        #[structopt(default_value="objtree.xml")]
+        output: String,
+    },
     /// Build minimaps of the specified maps.
     #[structopt(name = "minimap")]
     Minimap {
@@ -92,9 +133,13 @@ enum Command {
         #[structopt(long="disable", default_value="")]
         disable: String,
 
-        /// Run output through pngcrush automatically. Requires pngcrush to be installed.
+        /// Run output through pngcrush automatically. Requires pngcrush.
         #[structopt(long="pngcrush")]
         pngcrush: bool,
+
+        /// Run output through optipng automatically. Requires optipng.
+        #[structopt(long="optipng")]
+        optipng: bool,
 
         /// The list of maps to process.
         files: Vec<String>,
@@ -134,23 +179,83 @@ enum Command {
 fn run(opt: &Opt, command: &Command, context: &mut Context) {
     match *command {
         // --------------------------------------------------------------------
-        Command::ListPasses => {
-            for pass in render_passes::RENDER_PASSES {
-                println!("{}{}: {}", pass.name, if pass.default { " (default)" } else { "" }, pass.desc);
+        Command::ListPasses { json } => {
+            if json {
+                #[derive(Serialize)]
+                struct Pass<'a> {
+                    name: &'a str,
+                    desc: &'a str,
+                    default: bool,
+                }
+
+                let mut report = Vec::new();
+                for &render_passes::RenderPassInfo {
+                    name, desc, default, new: _,
+                } in render_passes::RENDER_PASSES {
+                    report.push(Pass { name, desc, default });
+                }
+                output_json(&report);
+            } else {
+                println!("default passes:");
+                let mut non_default = Vec::new();
+                for pass in render_passes::RENDER_PASSES {
+                    if pass.default {
+                        println!("{}: {}", pass.name, pass.desc);
+                    } else {
+                        non_default.push(pass);
+                    }
+                }
+                if !non_default.is_empty() {
+                    println!("\nadditional passes:");
+                    for pass in non_default {
+                        println!("{}: {}", pass.name, pass.desc);
+                    }
+                }
+            }
+        },
+        // --------------------------------------------------------------------
+        #[cfg(feature="xml")]
+        Command::ObjectTree { ref output } => {
+            context.objtree(opt);
+            match context.objtree.to_xml(output) {
+                Ok(()) => println!("saved {}", output),
+                Err(e) => {
+                    println!("i/o error saving {}:\n{}", output, e);
+                    context.exit_status = 1;
+                }
             }
         },
         // --------------------------------------------------------------------
         Command::Minimap {
-            ref output, min, max, ref enable, ref disable, ref files, pngcrush,
+            ref output, min, max, ref enable, ref disable, ref files,
+            pngcrush, optipng,
         } => {
             context.objtree(opt);
+            let Context { ref objtree, ref icon_cache, ref exit_status, parallel, .. } = *context;
 
-            let render_passes = dmm_tools::render_passes::configure(enable, disable);
-            for path in files.iter() {
-                let path: &std::path::Path = path.as_ref();
-                println!("{}", path.display());
+            let render_passes = &dmm_tools::render_passes::configure(enable, disable);
+            let paths: Vec<&Path> = files.iter().map(|p| p.as_ref()).collect();
+
+            let perform_job = move |path: &Path| {
+                let prefix = if parallel {
+                    let mut filename = path.file_name().unwrap().to_string_lossy().into_owned();
+                    filename.push_str(": ");
+                    println!("{}{}", filename, path.display());
+                    filename
+                } else {
+                    println!("{}", path.display());
+                    "    ".to_owned()
+                };
+
                 flame!(path.file_name().unwrap().to_string_lossy().into_owned());
-                let mut map = dmm::Map::from_file(path).unwrap();
+                let map = match dmm::Map::from_file(path) {
+                    Ok(map) => map,
+                    Err(e) => {
+                        eprintln!("Failed to load {}:\n{}", path.display(), e);
+                        exit_status.fetch_add(1, Ordering::Relaxed);
+                        return;
+                    }
+                };
 
                 let (dim_x, dim_y, dim_z) = map.dim_xyz();
                 let mut min = min.unwrap_or(CoordArg { x: 0, y: 0, z: 0 });
@@ -161,24 +266,29 @@ fn run(opt: &Opt, command: &Command, context: &mut Context) {
                 max.x = clamp(max.x, min.x, dim_x);
                 max.y = clamp(max.y, min.y, dim_y);
                 max.z = clamp(max.z, min.z, dim_z);
-                println!("    rendering from {} to {}", min, max);
+                println!("{}rendering from {} to {}", prefix, min, max);
 
                 for z in (min.z - 1)..(max.z) {
-                    println!("    generating z={}", 1 + z);
+                    println!("{}generating z={}", prefix, 1 + z);
                     let minimap_context = minimap::Context {
-                        objtree: &context.objtree,
+                        objtree: &objtree,
                         map: &map,
                         grid: map.z_level(z),
                         min: (min.x - 1, min.y - 1),
                         max: (max.x - 1, max.y - 1),
                         render_passes: &render_passes,
                     };
-                    let image = minimap::generate(minimap_context, &mut context.icon_cache).unwrap();
+                    let image = minimap::generate(minimap_context, icon_cache).unwrap();
+                    if let Err(e) = std::fs::create_dir_all(output) {
+                        eprintln!("Failed to create output directory {}:\n{}", output, e);
+                        exit_status.fetch_add(1, Ordering::Relaxed);
+                        return;
+                    }
                     let outfile = format!("{}/{}-{}.png", output, path.file_stem().unwrap().to_string_lossy(), 1 + z);
-                    println!("    saving {}", outfile);
+                    println!("{}saving {}", prefix, outfile);
                     image.to_file(outfile.as_ref()).unwrap();
                     if pngcrush {
-                        println!("    crushing {}", outfile);
+                        println!("    pngcrush {}", outfile);
                         let temp = format!("{}.temp", outfile);
                         assert!(std::process::Command::new("pngcrush")
                             .arg("-ow")
@@ -189,7 +299,25 @@ fn run(opt: &Opt, command: &Command, context: &mut Context) {
                             .unwrap()
                             .success(), "pngcrush failed");
                     }
+                    if optipng {
+                        println!("{}optipng {}", prefix, outfile);
+                        assert!(std::process::Command::new("optipng")
+                            .arg(&outfile)
+                            .stderr(std::process::Stdio::null())
+                            .status()
+                            .unwrap()
+                            .success(), "optipng failed");
+                    }
                 }
+            };
+
+            if parallel {
+                use rayon::iter::{IntoParallelIterator, ParallelIterator};
+                // Suboptimal due to mixing I/O in with what's meant for CPU
+                // tasks, but it should get the job done for now.
+                paths.into_par_iter().for_each(perform_job);
+            } else {
+                paths.into_iter().for_each(perform_job);
             }
         },
         // --------------------------------------------------------------------
@@ -218,8 +346,6 @@ fn run(opt: &Opt, command: &Command, context: &mut Context) {
             ref left, ref right,
         } => {
             use std::cmp::min;
-
-            context.objtree(opt);
 
             let path: &std::path::Path = left.as_ref();
             println!("{}", path.display());
@@ -251,7 +377,7 @@ fn run(opt: &Opt, command: &Command, context: &mut Context) {
             json, ref files,
         } => {
             if !json {
-                println!("non-JSON output is not yet supported");
+                eprintln!("non-JSON output is not yet supported");
             }
 
             #[derive(Serialize)]
@@ -273,10 +399,7 @@ fn run(opt: &Opt, command: &Command, context: &mut Context) {
                     num_keys: map.dictionary.len(),
                 });
             }
-
-            let stdout = std::io::stdout();
-            serde_json::to_writer(stdout.lock(), &report).unwrap();
-            println!();
+            output_json(&report);
         },
         // --------------------------------------------------------------------
     }
@@ -327,4 +450,10 @@ fn clamp(val: usize, min: usize, max: usize) -> usize {
     } else {
         val
     }
+}
+
+fn output_json<T: serde::Serialize>(t: &T) {
+    let stdout = std::io::stdout();
+    serde_json::to_writer(stdout.lock(), t).unwrap();
+    println!();
 }

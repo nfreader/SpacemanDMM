@@ -1,11 +1,11 @@
 //! The preprocessor.
 use std::collections::{HashMap, VecDeque};
-use std::io::{self, BufReader};
+use std::io;
 use std::fs::File;
 use std::path::{Path, PathBuf};
 
 use super::lexer::*;
-use super::{DMError, Location, HasLocation};
+use super::{DMError, Location, HasLocation, FileId, Context, Severity};
 
 // ----------------------------------------------------------------------------
 // Macro representation and predefined macros
@@ -36,7 +36,7 @@ fn default_defines(defines: &mut HashMap<String, Define>) {
         NORTHEAST = Int(5);
         SOUTHEAST = Int(6);
         NORTHWEST = Int(9);
-        NORTHEAST = Int(10);
+        SOUTHWEST = Int(10);
 
         FLOAT_LAYER = Int(-1);
         AREA_LAYER = Int(1);
@@ -117,11 +117,11 @@ fn default_defines(defines: &mut HashMap<String, Define>) {
 // The stack of currently #included files
 
 #[derive(Debug)]
-enum Include {
+enum Include<'ctx> {
     File {
         path: PathBuf,
-        file: u32,
-        lexer: Lexer<BufReader<File>>,
+        file: FileId,
+        lexer: Lexer<'ctx, io::Bytes<io::BufReader<File>>>,
     },
     Expansion {
         name: String,
@@ -130,17 +130,19 @@ enum Include {
     }
 }
 
-impl Include {
-    fn new(path: PathBuf, idx: u32) -> io::Result<Include> {
+impl<'ctx> Include<'ctx> {
+    fn new(context: &'ctx Context, path: PathBuf) -> io::Result<Include> {
+        let reader = io::BufReader::new(File::open(&path)?);
+        let idx = context.register_file(path.clone());
         Ok(Include::File {
-            lexer: Lexer::new(idx, BufReader::new(File::open(&path)?)),
+            lexer: Lexer::from_read(context, idx, reader),
             file: idx,
             path: path,
         })
     }
 }
 
-impl HasLocation for Include {
+impl<'ctx> HasLocation for Include<'ctx> {
     fn location(&self) -> Location {
         match self {
             &Include::File { ref lexer, .. } => lexer.location(),
@@ -149,11 +151,12 @@ impl HasLocation for Include {
     }
 }
 
-struct IncludeStack {
-    stack: Vec<Include>,
+#[derive(Debug)]
+struct IncludeStack<'ctx> {
+    stack: Vec<Include<'ctx>>,
 }
 
-impl IncludeStack {
+impl<'ctx> IncludeStack<'ctx> {
     fn top_file_path(&self) -> &Path {
         for each in self.stack.iter().rev() {
             if let &Include::File { ref path, .. } = each {
@@ -172,33 +175,29 @@ impl IncludeStack {
     }
 }
 
-impl HasLocation for IncludeStack {
+impl<'ctx> HasLocation for IncludeStack<'ctx> {
     fn location(&self) -> Location {
         if let Some(include) = self.stack.last() {
             include.location()
         } else {
-            Location {
-                file: 0,
-                line: 0,
-                column: 0,
-            }
+            Location::default()
         }
     }
 }
 
-impl Iterator for IncludeStack {
-    type Item = Result<LocatedToken, DMError>;
+impl<'ctx> Iterator for IncludeStack<'ctx> {
+    type Item = LocatedToken;
 
-    fn next(&mut self) -> Option<Result<LocatedToken, DMError>> {
+    fn next(&mut self) -> Option<LocatedToken> {
         loop {
             match self.stack.last_mut() {
                 Some(&mut Include::File { ref mut lexer, .. }) => match lexer.next() {
-                    Some(Err(e)) => return Some(Err(e)),
-                    Some(Ok(t)) => return Some(Ok(t)),
+                    //Some(Err(e)) => return Some(Err(e)),
+                    Some(t) => return Some(t),
                     None => {} // fall through
                 }
                 Some(&mut Include::Expansion { ref mut tokens, location, .. }) => match tokens.pop_front() {
-                    Some(token) => return Some(Ok(LocatedToken { location, token })),
+                    Some(token) => return Some(LocatedToken { location, token }),
                     None => {} // fall through
                 }
                 None => return None,
@@ -212,50 +211,52 @@ impl Iterator for IncludeStack {
 // The main preprocessor
 
 struct Ifdef {
+    location: Location,
     active: bool,
     chain_active: bool,
 }
 
 impl Ifdef {
-    fn new(active: bool) -> Ifdef {
-        Ifdef { active, chain_active: active }
+    fn new(location: Location, active: bool) -> Ifdef {
+        Ifdef { location, active, chain_active: active }
     }
     fn else_(self) -> Ifdef {
-        Ifdef { active: !self.active, chain_active: true }
+        Ifdef { location: self.location, active: !self.active, chain_active: true }
     }
     fn else_if(self, active: bool) -> Ifdef {
-        Ifdef { active, chain_active: self.chain_active || active }
+        Ifdef { location: self.location, active, chain_active: self.chain_active || active }
     }
 }
 
 /// C-like preprocessor for DM. Expands directives and macro invocations.
-pub struct Preprocessor {
+pub struct Preprocessor<'ctx> {
+    context: &'ctx Context,
+
     env_file: PathBuf,
     defines: HashMap<String, Define>,
-    files: Vec<PathBuf>,
     maps: Vec<PathBuf>,
     skins: Vec<PathBuf>,
-    include_stack: IncludeStack,
+    include_stack: IncludeStack<'ctx>,
     ifdef_stack: Vec<Ifdef>,
 
     last_input_loc: Location,
     output: VecDeque<Token>,
 }
 
-impl HasLocation for Preprocessor {
+impl<'ctx> HasLocation for Preprocessor<'ctx> {
     fn location(&self) -> Location {
         self.include_stack.location()
     }
 }
 
-impl Preprocessor {
-    pub fn new(env_file: PathBuf) -> io::Result<Self> {
+impl<'ctx> Preprocessor<'ctx> {
+    pub fn new(context: &'ctx Context, env_file: PathBuf) -> io::Result<Self> {
         let mut pp = Preprocessor {
-            files: vec![env_file.clone()],
+            context,
+            env_file: env_file.clone(),
             include_stack: IncludeStack {
-                stack: vec![Include::new(env_file.clone(), 0)?],
+                stack: vec![Include::new(context, env_file)?],
             },
-            env_file: env_file,
             defines: Default::default(),
             maps: Default::default(),
             skins: Default::default(),
@@ -267,15 +268,11 @@ impl Preprocessor {
         Ok(pp)
     }
 
-    pub fn file_path(&self, file: u32) -> &Path {
-        &self.files[file as usize]
-    }
-
     fn is_disabled(&self) -> bool {
         self.ifdef_stack.iter().any(|x| !x.active)
     }
 
-    fn inner_next(&mut self) -> Option<Result<LocatedToken, DMError>> {
+    fn inner_next(&mut self) -> Option<LocatedToken> {
         self.include_stack.next()
     }
 
@@ -290,10 +287,7 @@ impl Preprocessor {
         macro_rules! next {
             () => {
                 match self.inner_next() {
-                    Some(Ok(x)) => {
-                        x.token
-                    }
-                    Some(Err(e)) => return Err(e),
+                    Some(x) => x.token,
                     None => return Err(self.error("unexpected EOF"))
                 }
             }
@@ -325,24 +319,24 @@ impl Preprocessor {
                     "ifdef" => {
                         expect_token!((define_name) = Token::Ident(define_name, _));
                         expect_token!(() = Token::Punct(Punctuation::Newline));
-                        let z = self.defines.contains_key(&define_name);
-                        self.ifdef_stack.push(Ifdef::new(z));
+                        let enabled = self.defines.contains_key(&define_name);
+                        self.ifdef_stack.push(Ifdef::new(self.last_input_loc, enabled));
                     }
                     "ifndef" => {
                         expect_token!((define_name) = Token::Ident(define_name, _));
                         expect_token!(() = Token::Punct(Punctuation::Newline));
-                        let z = !self.defines.contains_key(&define_name);
-                        self.ifdef_stack.push(Ifdef::new(z));
+                        let enabled = !self.defines.contains_key(&define_name);
+                        self.ifdef_stack.push(Ifdef::new(self.last_input_loc, enabled));
                     }
                     "if" => {
-                        let z = self.evaluate()?;
-                        self.ifdef_stack.push(Ifdef::new(z));
+                        let enabled = self.evaluate()?;
+                        self.ifdef_stack.push(Ifdef::new(self.last_input_loc, enabled));
                     }
                     "elseif" => {
                         let last = self.ifdef_stack.pop().ok_or_else(||
                             DMError::new(self.last_input_loc, "unmatched #elseif"))?;
-                        let z = self.evaluate()?;
-                        self.ifdef_stack.push(last.else_if(z));
+                        let enabled = self.evaluate()?;
+                        self.ifdef_stack.push(last.else_if(enabled));
                     }
                     // anything other than ifdefs may be ifdef'd out
                     _ if self.is_disabled() => {}
@@ -361,18 +355,29 @@ impl Preprocessor {
                             path,
                         ].into_iter().rev() {
                             if !each.exists() { continue }
+                            // Wacky construct is used to let go of the borrow
+                            // of `each` so it can be used in the second half.
                             enum FileType { DMM, DMF, DM }
-                            let len = self.files.len() as u32;
-                            self.files.push(each.clone());
                             match match each.extension().and_then(|s| s.to_str()) {
                                 Some("dmm") => FileType::DMM,
                                 Some("dmf") => FileType::DMF,
                                 Some("dm") => FileType::DM,
-                                e => return Err(DMError::new(self.last_input_loc, format!("unknown file type {:?}", e))),
+                                Some(ext) => {
+                                    self.context.register_error(DMError::new(self.last_input_loc, format!("unknown extension {:?}", ext)));
+                                    return Ok(());
+                                }
+                                None => {
+                                    self.context.register_error(DMError::new(self.last_input_loc, "filename"));
+                                    return Ok(());
+                                }
                             } {
                                 FileType::DMM => self.maps.push(each),
                                 FileType::DMF => self.skins.push(each),
-                                FileType::DM => self.include_stack.stack.push(Include::new(each, len)?),
+                                FileType::DM => match Include::new(self.context, each) {
+                                    Ok(include) => self.include_stack.stack.push(include),
+                                    Err(e) => self.context.register_error(DMError::new(self.last_input_loc,
+                                        "failed to open file").set_cause(e)),
+                                },
                             }
                             return Ok(());
                         }
@@ -425,6 +430,7 @@ impl Preprocessor {
                                 }
                             }
                         }
+                        self.context.register_define(define_name.clone(), self.last_input_loc);
                         if args.is_empty() {
                             self.defines.insert(define_name, Define::Constant(subst));
                         } else {
@@ -578,9 +584,10 @@ impl Preprocessor {
                                                 }
                                                 expansion.push_back(Token::String(string));
                                             }
-                                            None => return Err(DMError::new(self.last_input_loc, "can only stringify arguments"))
+                                            None => return Err(DMError::new(self.last_input_loc, format!("can't stringify non-argument ident {:?}", argname))),
                                         }
-                                        _ => return Err(DMError::new(self.last_input_loc, "can only stringify arguments"))
+                                        Some(tok) => return Err(DMError::new(self.last_input_loc, format!("can't stringify non-ident '{}'", tok))),
+                                        None => return Err(DMError::new(self.last_input_loc, "can't stringify EOF")),
                                     }
                                 }
                                 _ => expansion.push_back(token),
@@ -605,23 +612,28 @@ impl Preprocessor {
     }
 }
 
-impl Iterator for Preprocessor {
-    type Item = Result<LocatedToken, DMError>;
+impl<'ctx> Iterator for Preprocessor<'ctx> {
+    type Item = LocatedToken;
 
-    fn next(&mut self) -> Option<Result<LocatedToken, DMError>> {
+    fn next(&mut self) -> Option<LocatedToken> {
         loop {
             if let Some(token) = self.output.pop_front() {
-                return Some(Ok(LocatedToken {
+                return Some(LocatedToken {
                     location: self.last_input_loc,
                     token: token,
-                }));
+                });
             }
 
             if let Some(tok) = self.inner_next() {
-                let tok = try_iter!(tok);
                 self.last_input_loc = tok.location;
-                try_iter!(self.real_next(tok.token));
+                if let Err(e) = self.real_next(tok.token) {
+                    self.context.register_error(e);
+                }
             } else {
+                while let Some(ifdef) = self.ifdef_stack.pop() {
+                    self.context.register_error(DMError::new(ifdef.location, "unterminated #if/#ifdef")
+                        .set_severity(Severity::Warning));
+                }
                 return None;
             }
         }

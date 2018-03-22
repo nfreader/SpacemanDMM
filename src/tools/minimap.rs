@@ -1,5 +1,4 @@
-use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use ndarray::{self, Axis};
 
@@ -7,8 +6,9 @@ use dm::objtree::*;
 use dm::objtree::subpath as subtype;
 use dm::constants::Constant;
 use dmm::{Map, Grid, Prefab};
-use dmi::{Image, IconFile};
+use dmi::Image;
 use render_passes::RenderPass;
+use icon_cache::IconCache;
 
 const TILE_SIZE: u32 = 32;
 
@@ -27,7 +27,7 @@ pub struct Context<'a> {
 
 pub fn generate(
     ctx: Context,
-    icon_cache: &mut HashMap<PathBuf, IconFile>,
+    icon_cache: &IconCache,
 ) -> Result<Image, ()> {
     flame!("minimap");
     let Context { objtree, map, grid, render_passes, .. } = ctx;
@@ -50,9 +50,9 @@ pub fn generate(
             for mut atom in get_atom_list(objtree, &map.dictionary[e], (x as u32, y as u32), render_passes) {
                 // icons which differ from their map states
                 let p = &atom.type_.path;
-                if p == "/obj/structures/table/wood/fancy/black" {
+                if p == "/obj/structure/table/wood/fancy/black" {
                     atom.set_var("icon", Constant::Resource("icons/obj/smooth_structures/fancy_table_black.dmi".into()));
-                } else if p == "/obj/structures/table/wood/fancy" {
+                } else if p == "/obj/structure/table/wood/fancy" {
                     atom.set_var("icon", Constant::Resource("icons/obj/smooth_structures/fancy_table.dmi".into()));
                 } else if subtype(p, "/turf/closed/mineral/") {
                     atom.set_var("pixel_x", Constant::Int(-4));
@@ -188,8 +188,10 @@ pub fn generate(
         let dir = atom.get_var("dir", objtree).to_int().unwrap_or(::dmi::SOUTH);
 
         let path: &Path = icon.as_ref();
-        let icon_file = icon_cache.entry(path.to_owned())
-            .or_insert_with(|| IconFile::from_file(path).unwrap());
+        let icon_file = match icon_cache.retrieve_shared(path) {
+            Some(icon_file) => icon_file,
+            None => continue 'atom,
+        };
 
         if let Some(mut rect) = icon_file.rect_of(&icon_state, dir) {
             let pixel_x = atom.get_var("pixel_x", ctx.objtree).to_int().unwrap_or(0);
@@ -324,6 +326,15 @@ impl<'a> Atom<'a> {
         })
     }
 
+    pub fn from_type_ref(type_: &'a Type, loc: (u32, u32)) -> Self {
+        Atom {
+            type_: type_,
+            prefab: None,
+            vars: Default::default(),
+            loc
+        }
+    }
+
     pub fn istype(&self, parent: &str) -> bool {
         subpath(&self.type_.path, parent)
     }
@@ -383,7 +394,7 @@ fn layer_of(objtree: &ObjectTree, atom: &Atom) -> i32 {
         -1_000   // above turfs
     } else if subtype(p, "/obj/structure/disposalpipe/") {
         -6_000
-    } else if subtype(p, "/obj/machinery/atmospherics/pipe/") && p.contains("hidden") {
+    } else if subtype(p, "/obj/machinery/atmospherics/pipe/") && !p.contains("visible") {
         -5_000
     } else if subtype(p, "/obj/structure/cable/") {
         -4_000

@@ -2,27 +2,33 @@
 
 use linked_hash_map::LinkedHashMap;
 
-use super::{DMError, Location, HasLocation};
+use super::{DMError, Location, HasLocation, Context};
 use super::lexer::{LocatedToken, Token, Punctuation};
 use super::objtree::ObjectTree;
 use super::ast::*;
 
 /// Parse a token stream, in the form emitted by the indent processor, into
 /// an object tree.
-pub fn parse<I>(iter: I) -> Result<ObjectTree, DMError> where
+///
+/// Compilation failures will return a best-effort parse, and diagnostics will
+/// be registered with the provided `Context`.
+pub fn parse<I>(context: &Context, iter: I) -> ObjectTree where
     I: IntoIterator<Item=Result<LocatedToken, DMError>>
 {
-    let mut parser = Parser::new(iter.into_iter());
-    let mut tree = match parser.root()? {
-        Some(()) => parser.tree,
-        None => return parser.parse_error(),
-    };
-    tree.finalize()?;
+    let mut parser = Parser::new(context, iter.into_iter());
+    match parser.root() {
+        Ok(Some(())) => {}
+        Ok(None) => context.register_error(parser.parse_error_inner()),
+        Err(err) => context.register_error(err),
+    }
 
     let procs_total = parser.procs_good + parser.procs_bad;
-    println!("parsed {}/{} proc bodies ({}%)", parser.procs_good, procs_total, (parser.procs_good * 100 / procs_total));
+    if procs_total > 0 {
+        eprintln!("parsed {}/{} proc bodies ({}%)", parser.procs_good, procs_total, (parser.procs_good * 100 / procs_total));
+    }
 
-    Ok(tree)
+    parser.tree.finalize(context);
+    parser.tree
 }
 
 type Ident = String;
@@ -79,6 +85,10 @@ impl<'a> PathStack<'a> {
             current: &[],
             rest,
         }
+    }
+
+    fn len(&self) -> usize {
+        self.parts.len() + self.parent.as_ref().map_or(0, |p| p.len())
     }
 }
 
@@ -195,7 +205,8 @@ oper_table! { BINARY_OPS;
 ///
 /// Results are accumulated into an inner `ObjectTree`. To parse an entire
 /// environment, use the `parse` or `parse_environment` functions.
-pub struct Parser<I> {
+pub struct Parser<'ctx, I> {
+    context: &'ctx Context,
     tree: ObjectTree,
 
     input: I,
@@ -208,18 +219,19 @@ pub struct Parser<I> {
     procs_good: u64,
 }
 
-impl<I> HasLocation for Parser<I> {
+impl<'ctx, I> HasLocation for Parser<'ctx, I> {
     fn location(&self) -> Location {
         self.location
     }
 }
 
-impl<I> Parser<I> where
+impl<'ctx, I> Parser<'ctx, I> where
     I: Iterator<Item=Result<LocatedToken, DMError>>
 {
     /// Construct a new parser using the given input stream.
-    pub fn new(input: I) -> Parser<I> {
+    pub fn new(context: &'ctx Context, input: I) -> Parser<I> {
         Parser {
+            context,
             tree: ObjectTree::with_builtins(),
 
             input,
@@ -236,17 +248,22 @@ impl<I> Parser<I> where
     // ------------------------------------------------------------------------
     // Basic setup
 
-    fn parse_error<T>(&mut self) -> Result<T, DMError> {
+    fn parse_error_inner(&mut self) -> DMError {
         let expected = self.expected.join(", ");
-        let got = self.next("");
-        let message;
-        if let Ok(got) = got {
-            message = format!("got {:?}, expected one of: {}", got, expected);
-            self.put_back(got);
-        } else {
-            message = format!("i/o error, expected one of: {}", expected);
+        match self.next("") {
+            Ok(got) => {
+                let message = format!("got '{}', expected one of: {}", got, expected);
+                self.put_back(got);
+                self.error(message)
+            },
+            Err(err) => {
+                self.error(format!("i/o error, expected one of: {}", expected)).set_cause(err)
+            }
         }
-        Err(self.error(message))
+    }
+
+    fn parse_error<T>(&mut self) -> Result<T, DMError> {
+        Err(self.parse_error_inner())
     }
 
     fn require<T>(&mut self, t: Result<Option<T>, DMError>) -> Result<T, DMError> {
@@ -291,7 +308,7 @@ impl<I> Parser<I> where
     }
 
     fn exact(&mut self, tok: Token) -> Status<()> {
-        let next = self.next(format!("{}", tok))?;
+        let next = self.next(format!("'{}'", tok))?;
         if next == tok {
             SUCCESS
         } else {
@@ -362,7 +379,8 @@ impl<I> Parser<I> where
         // read and calculate the current path
         let (absolute, path) = leading!(self.tree_path());
         if absolute && parent.parent.is_some() {
-            println!("WARNING: {:?} inside {:?}", path, parent);
+            self.context.register_error(self.error(format!("nested absolute path: {:?} inside {:?}", path, parent))
+                .set_severity(super::Severity::Warning));
         }
         let new_stack = PathStack {
             parent: if absolute { None } else { Some(&parent) },
@@ -374,19 +392,20 @@ impl<I> Parser<I> where
         // read the contents for real
         match self.next("contents")? {
             t @ Punct(LBrace) => {
-                self.tree.add_entry(self.location, new_stack.iter())?;
+                self.tree.add_entry(self.location, new_stack.iter(), new_stack.len())?;
                 self.put_back(t);
                 require!(self.tree_block(new_stack));
                 SUCCESS
             }
             Punct(Assign) => {
-                let expr = require!(self.expression(false));
+                let location = self.location;
+                let expr = require!(self.expression());
                 require!(self.exact(Punct(Semicolon)));
-                self.tree.add_var(self.location, new_stack.iter(), expr)?;
+                self.tree.add_var(location, new_stack.iter(), new_stack.len(), expr)?;
                 SUCCESS
             }
             Punct(LParen) => {
-                self.tree.add_proc(self.location, new_stack.iter())?;
+                self.tree.add_proc(self.location, new_stack.iter(), new_stack.len())?;
 
                 let parameters = require!(self.separated(Comma, RParen, None, |this| {
                     if let Some(()) = this.exact(Punct(Ellipsis))? {
@@ -402,7 +421,7 @@ impl<I> Parser<I> where
                     require!(this.var_annotations());
                     // = <expr>
                     let default = if let Some(()) = this.exact(Punct(Assign))? {
-                        Some(require!(this.expression(false)))
+                        Some(require!(this.expression()))
                     } else {
                         None
                     };
@@ -418,7 +437,7 @@ impl<I> Parser<I> where
                     };
                     // `in view(7)` or `in list("a", "b")` or ...
                     let in_list = if let Some(()) = this.exact_ident("in")? {
-                        Some(require!(this.expression(false)))
+                        Some(require!(this.expression()))
                     } else {
                         None
                     };
@@ -432,7 +451,11 @@ impl<I> Parser<I> where
                 // even when the proc body doesn't parse
                 let mut body_tt = Vec::new();
                 require!(self.read_any_tt(&mut body_tt));
-                let mut subparser = Parser::new(body_tt.iter().cloned().map(Ok));
+                while body_tt[0].token != Punct(LBrace) && body_tt[body_tt.len() - 1].token != Punct(Semicolon) {
+                    // read repeatedly until it's a block or ends with a newline
+                    require!(self.read_any_tt(&mut body_tt));
+                }
+                let mut subparser = Parser::new(self.context, body_tt.iter().cloned().map(Ok));
                 if subparser.block().is_ok() {
                     self.procs_good += 1;
                 } else {
@@ -441,7 +464,7 @@ impl<I> Parser<I> where
                 SUCCESS
             }
             other => {
-                self.tree.add_entry(self.location, new_stack.iter())?;
+                self.tree.add_entry(self.location, new_stack.iter(), new_stack.len())?;
                 self.put_back(other);
                 SUCCESS
             }
@@ -450,7 +473,7 @@ impl<I> Parser<I> where
 
     fn tree_entries(&mut self, parent: PathStack, terminator: Token) -> Status<()> {
         loop {
-            let next = self.next(format!("newline or {:?}", terminator))?;
+            let next = self.next(format!("newline, '{}'", terminator))?;
             if next == terminator || next == Token::Eof {
                 break
             } else if next == Token::Punct(Punctuation::Semicolon) {
@@ -496,10 +519,15 @@ impl<I> Parser<I> where
 
         require!(self.exact(Token::Punct(Punctuation::LBrace)));
         let mut statements = Vec::new();
-        self.separated(Punctuation::Semicolon, Punctuation::RBrace, Some(()), |this| {
-            statements.push(require!(this.statement()));
-            SUCCESS
-        })?;
+        loop {
+            if let Some(()) = self.exact(Token::Punct(Punctuation::RBrace))? {
+                break;
+            } else if let Some(()) = self.exact(Token::Punct(Punctuation::Semicolon))? {
+                continue;
+            } else {
+                statements.push(require!(self.statement()));
+            }
+        }
         success(statements)
     }
 
@@ -508,7 +536,7 @@ impl<I> Parser<I> where
         if let Some(()) = self.exact_ident("if")? {
             // statement :: 'if' '(' expression ')' block ('else' 'if' '(' expression ')' block)* ('else' block)?
             require!(self.exact(Token::Punct(Punctuation::LParen)));
-            let expr = require!(self.expression(false));
+            let expr = require!(self.expression());
             require!(self.exact(Token::Punct(Punctuation::RParen)));
             let block = require!(self.block());
             let mut arms = vec![(expr, block)];
@@ -517,7 +545,7 @@ impl<I> Parser<I> where
             while let Some(()) = self.exact_ident("else")? {
                 if let Some(()) = self.exact_ident("if")? {
                     require!(self.exact(Token::Punct(Punctuation::LParen)));
-                    let expr = require!(self.expression(false));
+                    let expr = require!(self.expression());
                     require!(self.exact(Token::Punct(Punctuation::RParen)));
                     let block = require!(self.block());
                     arms.push((expr, block));
@@ -531,17 +559,29 @@ impl<I> Parser<I> where
         } else if let Some(()) = self.exact_ident("while")? {
             // statement :: 'while' '(' expression ')' block
             require!(self.exact(Token::Punct(Punctuation::LParen)));
-            let expr = require!(self.expression(false));
+            let expr = require!(self.expression());
             require!(self.exact(Token::Punct(Punctuation::RParen)));
             success(Statement::While(expr, require!(self.block())))
+        } else if let Some(()) = self.exact_ident("do")? {
+            // statement :: 'do' block 'while' '(' expression ')' ';'
+            let block = require!(self.block());
+            require!(self.exact_ident("while"));
+            require!(self.exact(Token::Punct(Punctuation::LParen)));
+            let expr = require!(self.expression());
+            require!(self.exact(Token::Punct(Punctuation::RParen)));
+            require!(self.exact(Token::Punct(Punctuation::Semicolon)));
+            success(Statement::DoWhile(block, expr))
         // SINGLE-LINE STATEMENTS
         } else if let Some(()) = self.exact_ident("return")? {
-            // statement :: 'return' expression
-            success(Statement::Return(self.expression(false)?))
+            // statement :: 'return' expression ';'
+            let expression = self.expression()?;
+            require!(self.exact(Token::Punct(Punctuation::Semicolon)));
+            success(Statement::Return(expression))
         // EXPRESSION STATEMENTS
         } else {
-            let expr = require!(self.expression(false));
-            // statement :: expression
+            // statement :: expression ';'
+            let expr = require!(self.expression());
+            require!(self.exact(Token::Punct(Punctuation::Semicolon)));
             success(Statement::Expr(expr))
         }
     }
@@ -588,7 +628,7 @@ impl<I> Parser<I> where
             self.separated(Punctuation::Semicolon, Punctuation::RBrace, Some(()), |this| {
                 let key = require!(this.ident());
                 require!(this.exact(Token::Punct(Punctuation::Assign)));
-                let value = require!(this.expression(false));
+                let value = require!(this.expression());
                 vars.insert(key, value);
                 SUCCESS
             })?;
@@ -598,32 +638,41 @@ impl<I> Parser<I> where
     }
 
     /// Parse an expression at the current position.
-    ///
-    /// If `disallow_assign` is set, assignment operators are not considered.
-    /// This is useful when parsing the left-hand side of a list association.
-    pub fn expression(&mut self, disallow_assign: bool) -> Status<Expression> {
+    pub fn expression(&mut self) -> Status<Expression> {
         let mut expr = leading!(self.group());
         loop {
             // try to read the next operator
             let next = self.next("binary operator")?;
             let &info = match match next {
-                Token::Punct(Punctuation::Assign) if disallow_assign => None,
                 Token::Punct(p) => BINARY_OPS.iter().find(|op| op.token == p),
                 _ => None,
             } {
                 Some(info) => info,
                 None => {
                     self.put_back(next);
-                    return success(expr);
+                    break;
                 }
             };
 
             // trampoline high-strength expression parts as the lhs of the newly found op
-            expr = require!(self.expression_part(expr, info, disallow_assign));
+            expr = require!(self.expression_part(expr, info));
         }
+
+        if let Some(()) = self.exact(Token::Punct(Punctuation::QuestionMark))? {
+            let if_ = require!(self.expression());
+            require!(self.exact(Token::Punct(Punctuation::Colon)));
+            let else_ = require!(self.expression());
+            expr = Expression::TernaryOp {
+                cond: Box::new(expr),
+                if_: Box::new(if_),
+                else_: Box::new(else_),
+            };
+        }
+
+        success(expr)
     }
 
-    fn expression_part(&mut self, lhs: Expression, prev_op: OpInfo, disallow_assign: bool) -> Status<Expression> {
+    fn expression_part(&mut self, lhs: Expression, prev_op: OpInfo) -> Status<Expression> {
         use std::cmp::Ordering;
 
         let mut bits = vec![lhs];
@@ -633,7 +682,6 @@ impl<I> Parser<I> where
             // try to read the next operator...
             let next = self.next("binary operator")?;
             let &info = match match next {
-                Token::Punct(Punctuation::Assign) if disallow_assign => None,
                 Token::Punct(p) => BINARY_OPS.iter().find(|op| op.token == p),
                 _ => None
             } {
@@ -647,7 +695,7 @@ impl<I> Parser<I> where
             match info.strength.cmp(&prev_op.strength) {
                 Ordering::Greater => {
                     // the operator is stronger than us... recurse down
-                    rhs = require!(self.expression_part(rhs, info, disallow_assign));
+                    rhs = require!(self.expression_part(rhs, info));
                 }
                 Ordering::Less => {
                     // the operator is weaker than us... return up
@@ -712,6 +760,14 @@ impl<I> Parser<I> where
             }
         }
 
+        // This has the effect of stripping unnecessary parentheses, which
+        // simplifies later logic.
+        if unary_ops.is_empty() && follow.is_empty() {
+            if let Term::Expr(expr) = term {
+                return success(*expr);
+            }
+        }
+
         success(Expression::Base {
             unary: unary_ops,
             term: term,
@@ -745,7 +801,10 @@ impl<I> Parser<I> where
 
             // term :: 'list' list_lit
             Token::Ident(ref i, _) if i == "list" => {
-                match self.list_arguments()? {
+                // TODO: list arguments are actually subtly different, but
+                // we're going to pretend they're not to make code simpler, and
+                // anyone relying on the difference needs to fix their garbage
+                match self.arguments()? {
                     Some(args) => Term::List(args),
                     None => Term::Ident("list".to_owned()),
                 }
@@ -795,7 +854,7 @@ impl<I> Parser<I> where
 
             // term :: '(' expression ')'
             Token::Punct(LParen) => {
-                let expr = require!(self.expression(false));
+                let expr = require!(self.expression());
                 require!(self.exact(Token::Punct(Punctuation::RParen)));
                 Term::Expr(Box::new(expr))
             },
@@ -803,7 +862,7 @@ impl<I> Parser<I> where
             Token::InterpStringBegin(begin) => {
                 let mut parts = Vec::new();
                 loop {
-                    let expr = require!(self.expression(false));
+                    let expr = require!(self.expression());
                     match self.next("interpolated string part")? {
                         Token::InterpStringPart(part) => {
                             parts.push((expr, part));
@@ -834,7 +893,7 @@ impl<I> Parser<I> where
             }
             // follow :: '[' expression ']'
             Token::Punct(Punctuation::LBracket) => {
-                let expr = require!(self.expression(false));
+                let expr = require!(self.expression());
                 require!(self.exact(Token::Punct(Punctuation::RBracket)));
                 Follow::Index(Box::new(expr))
             },
@@ -850,21 +909,7 @@ impl<I> Parser<I> where
     /// a parenthesized, comma-separated list of expressions
     fn arguments(&mut self) -> Status<Vec<Expression>> {
         leading!(self.exact(Token::Punct(Punctuation::LParen)));
-        success(require!(self.separated(Punctuation::Comma, Punctuation::RParen, Some(Expression::from(Term::Null)), |this| this.expression(false))))
-    }
-
-    /// parenthesized arguments to the list() proc
-    fn list_arguments(&mut self) -> Status<Vec<(Expression, Option<Expression>)>> {
-        leading!(self.exact(Token::Punct(Punctuation::LParen)));
-        success(require!(self.separated(Punctuation::Comma, Punctuation::RParen, Some((Expression::from(Term::Null), None)), |this| {
-            let first_expr = require!(this.expression(true));
-            success(if this.exact(Token::Punct(Punctuation::Assign))?.is_some() {
-                let second_expr = require!(this.expression(false));
-                (first_expr, Some(second_expr))
-            } else {
-                (first_expr, None)
-            })
-        })))
+        success(require!(self.separated(Punctuation::Comma, Punctuation::RParen, Some(Expression::from(Term::Null)), |this| this.expression())))
     }
 
     fn separated<R: Clone, F: FnMut(&mut Self) -> Status<R>>(&mut self, sep: Punctuation, terminator: Punctuation, allow_empty: Option<R>, mut f: F) -> Status<Vec<R>> {

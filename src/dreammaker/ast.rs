@@ -17,6 +17,35 @@ pub enum UnaryOp {
     PostDecr,
 }
 
+impl UnaryOp {
+    /// Prepare to display this unary operator around (to the left or right of)
+    /// its operand.
+    pub fn around<T: fmt::Display>(self, expr: &T) -> Around<T> {
+        Around { op: self, expr }
+    }
+}
+
+/// A formatting wrapper created by `UnaryOp::around`.
+pub struct Around<'a, T: 'a> {
+    op: UnaryOp,
+    expr: &'a T,
+}
+
+impl<'a, T: fmt::Display> fmt::Display for Around<'a, T> {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        use self::UnaryOp::*;
+        match self.op {
+            Neg => write!(f, "-{}", self.expr),
+            Not => write!(f, "!{}", self.expr),
+            BitNot => write!(f, "~{}", self.expr),
+            PreIncr => write!(f, "++{}", self.expr),
+            PostIncr => write!(f, "{}++", self.expr),
+            PreDecr => write!(f, "--{}", self.expr),
+            PostDecr => write!(f, "{}--", self.expr),
+        }
+    }
+}
+
 /// The DM path operators.
 ///
 /// Which path operator is used typically only matters at the start of a path.
@@ -67,6 +96,33 @@ pub enum BinaryOp {
     Or,
 }
 
+impl fmt::Display for BinaryOp {
+    fn fmt(&self, fmt: &mut fmt::Formatter) -> fmt::Result {
+        use self::BinaryOp::*;
+        fmt.write_str(match *self {
+            Add => "+",
+            Sub => "-",
+            Mul => "*",
+            Div => "/",
+            Pow => "**",
+            Mod => "%",
+            Eq => "==",
+            NotEq => "!=",
+            Less => "<",
+            Greater => ">",
+            LessEq => "<=",
+            GreaterEq => ">=",
+            BitAnd => "&",
+            BitXor => "^",
+            BitOr => "|",
+            LShift => "<<",
+            RShift => ">>",
+            And => "&&",
+            Or => "||",
+        })
+    }
+}
+
 /// The assignment operators, including augmented assignment.
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
 pub enum AssignOp {
@@ -80,6 +136,24 @@ pub enum AssignOp {
     BitXorAssign,
     LShiftAssign,
     RShiftAssign,
+}
+
+impl fmt::Display for AssignOp {
+    fn fmt(&self, fmt: &mut fmt::Formatter) -> fmt::Result {
+        use self::AssignOp::*;
+        fmt.write_str(match *self {
+            Assign => "=",
+            AddAssign => "+=",
+            SubAssign => "-=",
+            MulAssign => "*=",
+            DivAssign => "/=",
+            BitAndAssign => "&=",
+            BitXorAssign => "^=",
+            BitOrAssign => "|=",
+            LShiftAssign => "<<=",
+            RShiftAssign => ">>=",
+        })
+    }
 }
 
 macro_rules! augmented {
@@ -197,14 +271,26 @@ pub enum Expression {
         /// The right-hand side of the assignment.
         rhs: Box<Expression>,
     },
+    /// A ternary operation.
+    TernaryOp {
+        /// The condition.
+        cond: Box<Expression>,
+        /// The value if the condition is truthy.
+        if_: Box<Expression>,
+        /// The value otherwise.
+        else_: Box<Expression>,
+    }
 }
 
 impl From<Term> for Expression {
     fn from(term: Term) -> Expression {
-        Expression::Base {
-            unary: vec![],
-            follow: vec![],
-            term,
+        match term {
+            Term::Expr(expr) => *expr,
+            term => Expression::Base {
+                unary: vec![],
+                follow: vec![],
+                term,
+            }
         }
     }
 }
@@ -221,8 +307,8 @@ pub enum Term {
         /// The list of arguments to pass to the `New()` proc.
         args: Option<Vec<Expression>>,
     },
-    /// A `list` call. Elements have optional associations.
-    List(Vec<(Expression, Option<Expression>)>),
+    /// A `list` call. Associations are represented by assignment expressions.
+    List(Vec<Expression>),
     /// An unscoped function call.
     Call(String, Vec<Expression>),
     /// A prefab literal (path + vars).
@@ -291,5 +377,6 @@ pub enum Statement {
     Expr(Expression),
     Return(Option<Expression>),
     While(Expression, Vec<Statement>),
+    DoWhile(Vec<Statement>, Expression),
     If(Vec<(Expression, Vec<Statement>)>, Option<Vec<Statement>>),
 }
