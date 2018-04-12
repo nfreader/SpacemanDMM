@@ -95,6 +95,12 @@ table! {
     b"~",	BitNot;
 }
 
+impl fmt::Display for Punctuation {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        f.write_str(::std::str::from_utf8(self.value()).unwrap())
+    }
+}
+
 /// A single DM token.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Token {
@@ -186,7 +192,7 @@ impl fmt::Display for Token {
         use self::Token::*;
         match *self {
             Eof => f.write_str("__EOF__"),
-            Punct(p) => f.write_str(::std::str::from_utf8(p.value()).unwrap()),
+            Punct(p) => write!(f, "{}", p),
             Ident(ref i, _) => f.write_str(i),
             String(ref i) => write!(f, "\"{}\"", i),
             InterpStringBegin(ref i) => write!(f, "\"{}[", i),
@@ -246,17 +252,33 @@ enum Directive {
 }
 
 /// The lexer, which serves as a source of tokens through iteration.
-#[derive(Debug)]
 pub struct Lexer<'ctx, I> {
     context: &'ctx Context,
     input: I,
     next: Option<u8>,
     /// The location of the last character returned by `next()`.
     location: Location,
+    final_newline: bool,
     at_line_head: bool,
     at_line_end: bool,
     directive: Directive,
     interp_stack: Vec<Interpolation>,
+}
+
+impl<'ctx, I> fmt::Debug for Lexer<'ctx, I> {
+    fn fmt(&self, fmt: &mut fmt::Formatter) -> fmt::Result {
+        fmt.debug_struct("Lexer")
+            .field("context", self.context)
+            // input omitted
+            .field("next", &self.next)
+            .field("location", &self.location)
+            .field("final_newline", &self.final_newline)
+            .field("at_line_head", &self.at_line_head)
+            .field("at_line_end", &self.at_line_end)
+            .field("directive", &self.directive)
+            .field("interp_stack", &self.interp_stack)
+            .finish()
+    }
 }
 
 impl<'ctx, I: Iterator<Item=io::Result<u8>>> HasLocation for Lexer<'ctx, I> {
@@ -284,6 +306,7 @@ impl<'ctx, I: Iterator<Item=io::Result<u8>>> Lexer<'ctx, I> {
                 line: 1,
                 column: 0,
             },
+            final_newline: false,
             at_line_head: true,
             at_line_end: false,
             directive: Directive::None,
@@ -299,7 +322,10 @@ impl<'ctx, I: Iterator<Item=io::Result<u8>>> Lexer<'ctx, I> {
         if self.at_line_end {
             self.at_line_end = false;
             self.at_line_head = true;
-            self.location.line += 1;
+            match self.location.line.checked_add(1) {
+                Some(new) => self.location.line = new,
+                None => panic!("per-file line limit of {} exceeded", self.location.line),
+            }
             self.location.column = 0;
             self.directive = Directive::None;
         }
@@ -311,7 +337,10 @@ impl<'ctx, I: Iterator<Item=io::Result<u8>>> Lexer<'ctx, I> {
                 } else if ch != b'\t' && ch != b' ' && self.at_line_head {
                     self.at_line_head = false;
                 }
-                self.location.column += 1;
+                match self.location.column.checked_add(1) {
+                    Some(new) => self.location.column = new,
+                    None => panic!("per-line column limit of {} exceeded", self.location.column),
+                }
                 Some(ch)
             }
             Some(Err(err)) => {
@@ -594,8 +623,8 @@ impl<'ctx, I: Iterator<Item=io::Result<u8>>> Iterator for Lexer<'ctx, I> {
                 Some(t) => t,
                 None => {
                     // always end with a newline
-                    if !self.at_line_head {
-                        self.at_line_head = true;
+                    if !self.final_newline {
+                        self.final_newline = true;
                         self.location.column += 1;
                         return Some(LocatedToken {
                             location: self.location(),
@@ -672,6 +701,7 @@ impl<'ctx, I: Iterator<Item=io::Result<u8>>> Iterator for Lexer<'ctx, I> {
                         skip_newlines = true;
                         continue;
                     }
+                    b'@' => continue,  // TODO: parse these rather than ignoring them
                     _ => {
                         if !found_illegal {
                             self.context.register_error(self.error(format!("illegal byte 0x{:x}", first)));

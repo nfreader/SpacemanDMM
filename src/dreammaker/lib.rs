@@ -2,6 +2,7 @@
 #[cfg(feature="xml-rs")] extern crate xml;
 extern crate petgraph;
 extern crate linked_hash_map;
+extern crate interval_tree;
 
 use std::io;
 use std::path::Path;
@@ -24,6 +25,7 @@ pub mod lexer;
 pub mod preprocessor;
 pub mod indents;
 pub mod parser;
+pub mod annotation;
 pub mod ast;
 pub mod objtree;
 mod builtins;
@@ -35,11 +37,11 @@ impl Context {
     /// Will only return failure on an `io::Error`. Compilation failures will
     /// return a best-effort parse. Call `print_all_errors` to pretty-print
     /// errors to standard error.
-    pub fn parse_environment(&mut self, dme: &Path) -> io::Result<objtree::ObjectTree> {
+    pub fn parse_environment(&self, dme: &Path) -> io::Result<objtree::ObjectTree> {
         Ok(parser::parse(self,
             indents::IndentProcessor::new(self,
                 preprocessor::Preprocessor::new(self, dme.to_owned())?
-            ).map(Ok)
+            )
         ))
     }
 }
