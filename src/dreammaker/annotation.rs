@@ -3,6 +3,7 @@
 
 use interval_tree::{IntervalTree, RangePairIter, RangeInclusive, range};
 use super::Location;
+use super::ast::Statement;
 
 pub type Iter<'a> = RangePairIter<'a, Location, Annotation>;
 
@@ -10,6 +11,10 @@ pub type Iter<'a> = RangePairIter<'a, Location, Annotation>;
 pub enum Annotation {
     TreeBlock(Vec<String>),
     TreePath(Vec<String>),
+    Variable(Vec<String>),
+    ProcHeader(Vec<String>),
+    ProcBody(Vec<String>),
+    ProcBodyDetails(Vec<Statement>),
     Ident(String),
 }
 

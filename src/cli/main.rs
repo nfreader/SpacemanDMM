@@ -24,6 +24,8 @@ use dmm_tools::*;
 // ----------------------------------------------------------------------------
 // Main driver
 
+const DEFAULT_DME: &str = "tgstation.dme";
+
 fn main() {
     let opt = Opt::from_clap(&Opt::clap()
         .long_version(concat!(
@@ -33,6 +35,7 @@ fn main() {
         .get_matches());
 
     let mut context = Context::default();
+    context.dm_context.set_print_severity(Some(dm::Severity::Error));
     rayon::ThreadPoolBuilder::new()
         .num_threads(opt.jobs)
         .build_global()
@@ -60,15 +63,19 @@ struct Context {
 
 impl Context {
     fn objtree(&mut self, opt: &Opt) {
-        println!("parsing {}", opt.environment);
+        let pathbuf;
+        let environment: &std::path::Path = match opt.environment {
+            Some(ref env) => env.as_ref(),
+            None => match detect_environment() {
+                Ok(Some(found)) => { pathbuf = found; &pathbuf },
+                _ => DEFAULT_DME.as_ref(),
+            }
+        };
+        println!("parsing {}", environment.display());
         flame!("parse");
-        match self.dm_context.parse_environment(opt.environment.as_ref()) {
+        match self.dm_context.parse_environment(environment) {
             Ok(tree) => {
                 self.objtree = tree;
-                self.dm_context.print_all_errors();
-                if !self.dm_context.errors().is_empty() {
-                    println!("there were some parsing errors; render may be inaccurate")
-                }
             },
             Err(e) => {
                 eprintln!("i/o error opening environment:\n{}", e);
@@ -76,6 +83,21 @@ impl Context {
             }
         };
     }
+}
+
+fn detect_environment() -> std::io::Result<Option<std::path::PathBuf>> {
+    for entry in std::fs::read_dir(".")? {
+        if let Ok(entry) = entry {
+            let name = entry.file_name();
+            if {
+                let utf8_name = name.to_string_lossy();
+                utf8_name.ends_with(".dme") && utf8_name != DEFAULT_DME
+            } {
+                return Ok(Some(name.into()));
+            }
+        }
+    }
+    Ok(None)
 }
 
 #[derive(StructOpt, Debug)]
@@ -86,8 +108,8 @@ and you are welcome to redistribute it under the conditions of the GNU
 General Public License version 3.")]
 struct Opt {
     /// The environment file to operate under.
-    #[structopt(short="e", long="env", default_value="tgstation.dme")]
-    environment: String,
+    #[structopt(short="e", long="env")]
+    environment: Option<String>,
 
     #[structopt(short="v", long="verbose")]
     verbose: bool,
@@ -120,6 +142,13 @@ enum Command {
         /// The output filename.
         #[structopt(default_value="objtree.xml")]
         output: String,
+    },
+    /// Check the environment for errors and warnings.
+    #[structopt(name = "check")]
+    Check {
+        /// The minimum severity to print, of "error", "warning", "info", "hint".
+        #[structopt(long="severity", default_value="info")]
+        severity: String,
     },
     /// Build minimaps of the specified maps.
     #[structopt(name = "minimap")]
@@ -237,11 +266,26 @@ fn run(opt: &Opt, command: &Command, context: &mut Context) {
             }
         },
         // --------------------------------------------------------------------
+        Command::Check { ref severity } => {
+            let severity = match severity.as_str() {
+                "error" => dm::Severity::Error,
+                "warning" => dm::Severity::Warning,
+                "info" => dm::Severity::Info,
+                _ => dm::Severity::Hint,
+            };
+            context.dm_context.set_print_severity(Some(severity));
+            context.objtree(opt);
+            *context.exit_status.get_mut() = context.dm_context.errors().iter().filter(|e| e.severity() <= severity).count() as isize;
+        },
+        // --------------------------------------------------------------------
         Command::Minimap {
             ref output, min, max, ref enable, ref disable, ref files,
             pngcrush, optipng,
         } => {
             context.objtree(opt);
+            if context.dm_context.errors().iter().filter(|e| e.severity() <= dm::Severity::Error).next().is_some() {
+                println!("there were some parsing errors; render may be inaccurate")
+            }
             let Context { ref objtree, ref icon_cache, ref exit_status, parallel, .. } = *context;
 
             let render_passes = &dmm_tools::render_passes::configure(enable, disable);

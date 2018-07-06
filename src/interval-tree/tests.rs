@@ -15,11 +15,11 @@ fn test_getters(){
     t.insert(RangeInclusive::new(1,1), data);
     t.insert(RangeInclusive::new(2,2), data+1);
     t.insert(RangeInclusive::new(3,3), data+2);
-    assert!(t.get_or(RangeInclusive::new(1,1), &0) == &data);
-    assert!(t.get_or(RangeInclusive::new(2,2), &0) == &(data+1));
-    assert!(t.get_or(RangeInclusive::new(3,3), &0) == &(data+2));
-    assert!(t.get_or(RangeInclusive::new(4,4), &0) == &0);
-    assert!(t.get(RangeInclusive::new(4,4)) == None);
+    assert_eq!(t.get_or(RangeInclusive::new(1,1), &[0]), &[data]);
+    assert_eq!(t.get_or(RangeInclusive::new(2,2), &[0]), &[data+1]);
+    assert_eq!(t.get_or(RangeInclusive::new(3,3), &[0]), &[data+2]);
+    assert_eq!(t.get_or(RangeInclusive::new(4,4), &[0]), &[0]);
+    assert_eq!(t.get(RangeInclusive::new(4,4)), None);
 }
 
 #[test]
@@ -48,21 +48,21 @@ fn test_empty(){
 }
 
 #[test]
-fn test_delete(){
+fn test_remove(){
     let data = 1337;
     let mut t = IntervalTree::<i32>::new();
     t.insert(RangeInclusive::new(1,1), data);
     t.insert(RangeInclusive::new(2,2), data+1);
     t.insert(RangeInclusive::new(3,3), data+2);
-    t.delete(RangeInclusive::new(1,1));
+    t.remove(RangeInclusive::new(1,1));
     assert!(!t.contains(RangeInclusive::new(1,1)));
     assert!( t.contains(RangeInclusive::new(2,2)));
     assert!( t.contains(RangeInclusive::new(3,3)));
-    t.delete(RangeInclusive::new(2,2));
+    t.remove(RangeInclusive::new(2,2));
     assert!(!t.contains(RangeInclusive::new(1,1)));
     assert!(!t.contains(RangeInclusive::new(2,2)));
     assert!( t.contains(RangeInclusive::new(3,3)));
-    t.delete(RangeInclusive::new(3,3));
+    t.remove(RangeInclusive::new(3,3));
     assert!(!t.contains(RangeInclusive::new(1,1)));
     assert!(!t.contains(RangeInclusive::new(2,2)));
     assert!(!t.contains(RangeInclusive::new(3,3)));
@@ -70,6 +70,7 @@ fn test_delete(){
 }
 
 #[test]
+#[ignore]
 fn test_performance(){
     let mut t = IntervalTree::<i32>::new();
     let data = 1337;
@@ -77,8 +78,8 @@ fn test_performance(){
     for _ in 1..10000 {
         t.insert(RangeInclusive::new(1,1), data);
         t.insert(RangeInclusive::new(20000,20000), data+1);
-        t.delete(RangeInclusive::new(1,1));
-        t.delete(RangeInclusive::new(20000,20000));
+        t.remove(RangeInclusive::new(1,1));
+        t.remove(RangeInclusive::new(20000,20000));
     }
     let end = PreciseTime::now();
     let diff_simple = start.to(end).num_milliseconds();
@@ -90,8 +91,8 @@ fn test_performance(){
     for _ in 1..10000 {
         t.insert(RangeInclusive::new(1,1), data);
         t.insert(RangeInclusive::new(20000,20000), data+1);
-        t.delete(RangeInclusive::new(1,1));
-        t.delete(RangeInclusive::new(20000,20000));
+        t.remove(RangeInclusive::new(1,1));
+        t.remove(RangeInclusive::new(20000,20000));
     }
     let end_2 = PreciseTime::now();
     let diff_full = start_2.to(end_2).num_milliseconds();
@@ -103,13 +104,13 @@ fn test_min(){
     let mut t = IntervalTree::<i32>::new();
     assert!{t.min().is_none()};
     t.insert(RangeInclusive::new(50,50), 1337);
-    assert_eq!{t.min().expect("get 1 min"),(&RangeInclusive::new(50,50),&1337)};
+    assert_eq!{t.min().expect("get 1 min"),(&RangeInclusive::new(50,50),&[1337][..])};
     t.insert(RangeInclusive::new(49,49),1338);
-    assert_eq!{t.min().expect("get 2 min"),(&RangeInclusive::new(49,49),&1338)};
+    assert_eq!{t.min().expect("get 2 min"),(&RangeInclusive::new(49,49),&[1338][..])};
     t.insert(RangeInclusive::new(47,47),1339);
-    assert_eq!{t.min().expect("get 3 min"),(&RangeInclusive::new(47,47),&1339)};
+    assert_eq!{t.min().expect("get 3 min"),(&RangeInclusive::new(47,47),&[1339][..])};
     t.insert(RangeInclusive::new(48,48),1340);
-    assert_eq!{t.min().expect("get 4 min"),(&RangeInclusive::new(47,47),&1339)};
+    assert_eq!{t.min().expect("get 4 min"),(&RangeInclusive::new(47,47),&[1339][..])};
 }
 
 #[test]
@@ -183,7 +184,7 @@ fn test_range_iter_nontrivial(){
             //assert!(t.test_theban_interval_tree());
         } else {
             set.remove(&range);
-            t.delete(range);
+            t.remove(range);
             assert!(!t.contains(range));
             //assert!(t.test_theban_interval_tree());
         };

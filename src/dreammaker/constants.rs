@@ -1,11 +1,13 @@
 //! The constant folder/evaluator, used by the preprocessor and object tree.
 use std::fmt;
+use std::path::Path;
 
 use linked_hash_map::LinkedHashMap;
 
 use super::{DMError, Location, HasLocation, Context};
 use super::objtree::*;
 use super::ast::*;
+use super::preprocessor::DefineMap;
 
 /// A DM constant, usually a literal or simple combination of other constants.
 ///
@@ -122,11 +124,47 @@ impl Constant {
             _ => false,
         }
     }
+
+    pub fn as_str(&self) -> Option<&str> {
+        match self {
+            &Constant::String(ref s) => Some(s.as_ref()),
+            _ => None,
+        }
+    }
+
+    pub fn as_path(&self) -> Option<&Path> {
+        match self {
+            &Constant::String(ref s) |
+            &Constant::Resource(ref s) => Some(s.as_ref()),
+            _ => None,
+        }
+    }
 }
 
 impl Default for Constant {
     fn default() -> Self {
         Constant::Null(None)
+    }
+}
+
+impl From<i32> for Constant {
+    fn from(value: i32) -> Constant {
+        Constant::Int(value)
+    }
+}
+
+impl From<f32> for Constant {
+    fn from(value: f32) -> Constant {
+        Constant::Float(value)
+    }
+}
+
+impl From<bool> for Constant {
+    fn from(value: bool) -> Constant {
+        match value {
+            true => Constant::Int(1),
+            false => Constant::Int(0),
+        }
     }
 }
 
@@ -136,7 +174,6 @@ impl fmt::Display for Constant {
             Constant::Null(_) => f.write_str("null"),
             Constant::New { ref type_, ref args } => {
                 write!(f, "new{}", type_)?;
-                // TODO: make the Vec an Option<Vec>
                 if let Some(args) = args.as_ref() {
                     write!(f, "(")?;
                     let mut first = true;
@@ -205,19 +242,31 @@ impl fmt::Display for ConstFn {
 // The constant evaluator
 
 /// Evaluate all the type-level variables in an object tree into constants.
-pub(crate) fn evaluate_all(context: &Context, tree: &mut ObjectTree) {
+pub(crate) fn evaluate_all(context: &Context, tree: &mut ObjectTree, sloppy: bool) {
+    let mut been_sloppy = false;
+
     for ty in tree.graph.node_indices() {
         let keys: Vec<String> = tree.graph.node_weight(ty).unwrap().vars.keys().cloned().collect();
         for key in keys {
-            if !tree.graph.node_weight(ty).unwrap().get_declaration(&key, tree).map_or(true, |x| x.is_const_evaluable() && (x.is_const || ty != NodeIndex::new(0))) {
+            if !tree.graph.node_weight(ty).unwrap().get_declaration(&key, tree).map_or(true, |x| x.var_type.is_const_evaluable() && (x.var_type.is_const || ty != NodeIndex::new(0))) {
                 continue  // skip non-constant-evaluable vars
             }
             match constant_ident_lookup(tree, ty, &key, false) {
                 Err(err) => context.register_error(err),
                 Ok(ConstLookup::Found(_, _)) => {}
                 Ok(ConstLookup::Continue(_)) => {
+                    let extra = if sloppy {
+                        if been_sloppy {
+                            continue;
+                        }
+                        been_sloppy = true;
+                        "\nignoring further errors of this type due to earlier parse failures"
+                    } else {
+                        ""
+                    };
+
                     context.register_error(DMError::new(tree.graph.node_weight(ty).unwrap().vars[&key].value.location,
-                        format!("undefined var '{}' on type '{}'", key, tree.graph.node_weight(ty).unwrap().path)));
+                        format!("undefined var '{}' on type '{}'{}", key, tree.graph.node_weight(ty).unwrap().path, extra)));
                 }
             }
         }
@@ -225,8 +274,13 @@ pub(crate) fn evaluate_all(context: &Context, tree: &mut ObjectTree) {
 }
 
 /// Evaluate an expression in the absence of any surrounding context.
-pub fn simple_evaluate(expr: Expression) -> Result<Constant, DMError> {
-    ConstantFolder { tree: None, location: Location::default(), ty: NodeIndex::new(0) }.expr(expr, None)
+pub fn simple_evaluate(location: Location, expr: Expression) -> Result<Constant, DMError> {
+    ConstantFolder { tree: None, location, ty: NodeIndex::new(0), defines: None }.expr(expr, None)
+}
+
+/// Evaluate an expression in the preprocessor, with `defined()` available.
+pub fn preprocessor_evaluate(location: Location, expr: Expression, defines: &DefineMap) -> Result<Constant, DMError> {
+    ConstantFolder { tree: None, location, ty: NodeIndex::new(0), defines: Some(defines) }.expr(expr, None)
 }
 
 enum ConstLookup {
@@ -248,30 +302,30 @@ fn constant_ident_lookup(tree: &mut ObjectTree, ty: NodeIndex, ident: &str, must
         match type_.vars.get_mut(ident) {
             None => { return Ok(ConstLookup::Continue(parent)); }
             Some(var) => match var.value.constant.clone() {
-                Some(constant) => { return Ok(ConstLookup::Found(decl.type_path.clone(), constant)); }
+                Some(constant) => { return Ok(ConstLookup::Found(decl.var_type.type_path.clone(), constant)); }
                 None => match var.value.expression.clone() {
                     Some(expr) => {
                         if var.value.being_evaluated {
                             return Err(DMError::new(var.value.location, format!("recursive constant reference: {}", ident)));
-                        } else if !decl.is_const_evaluable() {
+                        } else if !decl.var_type.is_const_evaluable() {
                             return Err(DMError::new(var.value.location, format!("non-const variable: {}", ident)));
-                        } else if !decl.is_static && must_be_static {
+                        } else if !decl.var_type.is_static && must_be_static {
                             return Err(DMError::new(var.value.location, format!("non-static variable: {}", ident)));
                         }
                         var.value.being_evaluated = true;
-                        (var.value.location, decl.type_path, expr)
+                        (var.value.location, decl.var_type.type_path, expr)
                     }
                     None => {
-                        let c = Constant::Null(Some(decl.type_path.clone()));
+                        let c = Constant::Null(Some(decl.var_type.type_path.clone()));
                         var.value.constant = Some(c.clone());
-                        return Ok(ConstLookup::Found(decl.type_path, c));
+                        return Ok(ConstLookup::Found(decl.var_type.type_path, c));
                     }
                 }
             }
         }
     };
     // evaluate full_value
-    let value = ConstantFolder { tree: Some(tree), location, ty }
+    let value = ConstantFolder { tree: Some(tree), defines: None, location, ty }
         .expr(expr, if type_hint.is_empty() { None } else { Some(&type_hint) })?;
     // and store it into 'value', then return it
     let var = tree.graph.node_weight_mut(ty).unwrap().vars.get_mut(ident).unwrap();
@@ -282,6 +336,7 @@ fn constant_ident_lookup(tree: &mut ObjectTree, ty: NodeIndex, ident: &str, must
 
 struct ConstantFolder<'a> {
     tree: Option<&'a mut ObjectTree>,
+    defines: Option<&'a DefineMap>,
     location: Location,
     ty: NodeIndex,
 }
@@ -351,10 +406,13 @@ impl<'a> ConstantFolder<'a> {
 
     fn follow(&mut self, term: Constant, follow: Follow) -> Result<Constant, DMError> {
         match (term, follow) {
-            // Meant to handle the GLOB.SCI_FREQ case.
+            // Meant to handle the GLOB.SCI_FREQ case:
+            //     /datum/globals/var/static/SCI_FREQ = 1351
+            //     /var/datum/globals/GLOB = null
+            //     /obj/var/freq = GLOB.SCI_FREQ   // initial() is 1351
             // If it's a reference to a type-hinted value, look up the field in
             // its static variables (but not non-static variables).
-            (Constant::Null(Some(type_hint)), Follow::Field(field_name)) => {
+            (Constant::Null(Some(type_hint)), Follow::Field(_, field_name)) => {
                 let mut full_path = String::new();
                 for each in type_hint {
                     full_path.push('/');  // TODO: use path ops here?
@@ -364,12 +422,6 @@ impl<'a> ConstantFolder<'a> {
                     Some(&idx) => self.recursive_lookup(idx, &field_name, true),
                     None => Err(self.error(format!("unknown typepath {}", full_path))),
                 }
-            }
-            (Constant::String(string), Follow::Cast(cast)) => {
-                if cast != "text" {
-                    return Err(self.error(format!("cannot cast string to {:?}", cast)));
-                }
-                Ok(Constant::String(string))
             }
             (term, follow) => Err(self.error(format!("non-constant expression follower: {} {:?}", term, follow)))
         }
@@ -396,10 +448,10 @@ impl<'a> ConstantFolder<'a> {
         macro_rules! numeric {
             ($name:ident $oper:tt) => {
                 match (op, lhs, rhs) {
-                    (BinaryOp::$name, Int(lhs), Int(rhs)) => return Ok(Int(lhs $oper rhs)),
-                    (BinaryOp::$name, Int(lhs), Float(rhs)) => return Ok(Float(lhs as f32 $oper rhs)),
-                    (BinaryOp::$name, Float(lhs), Int(rhs)) => return Ok(Float(lhs $oper rhs as f32)),
-                    (BinaryOp::$name, Float(lhs), Float(rhs)) => return Ok(Float(lhs $oper rhs)),
+                    (BinaryOp::$name, Int(lhs), Int(rhs)) => return Ok(Constant::from(lhs $oper rhs)),
+                    (BinaryOp::$name, Int(lhs), Float(rhs)) => return Ok(Constant::from((lhs as f32) $oper rhs)),
+                    (BinaryOp::$name, Float(lhs), Int(rhs)) => return Ok(Constant::from(lhs $oper (rhs as f32))),
+                    (BinaryOp::$name, Float(lhs), Float(rhs)) => return Ok(Constant::from(lhs $oper rhs)),
                     (_, lhs_, rhs_) => { lhs = lhs_; rhs = rhs_; }
                 }
             }
@@ -408,6 +460,23 @@ impl<'a> ConstantFolder<'a> {
         numeric!(Sub -);
         numeric!(Mul *);
         numeric!(Div /);
+        numeric!(Less <);
+        numeric!(LessEq <=);
+        numeric!(Greater >);
+        numeric!(GreaterEq >=);
+        match (op, lhs, rhs) {
+            (BinaryOp::Pow, Int(lhs), Int(rhs)) if rhs >= 0 => {
+                // protect against panics from out-of-bounds pow
+                if rhs >= 2 && (i32::max_value() as f32).log(lhs as f32) < rhs as f32 {
+                    return Err(self.error(format!("out-of-range {:?}: {} {} {}", op, lhs, op, rhs)));
+                }
+                return Ok(Constant::from(lhs.pow(rhs as u32)))
+            }
+            (BinaryOp::Pow, Int(lhs), Float(rhs)) => return Ok(Constant::from((lhs as f32).powf(rhs))),
+            (BinaryOp::Pow, Float(lhs), Int(rhs)) => return Ok(Constant::from(lhs.powi(rhs))),
+            (BinaryOp::Pow, Float(lhs), Float(rhs)) => return Ok(Constant::from(lhs.powf(rhs))),
+            (_, lhs_, rhs_) => { lhs = lhs_; rhs = rhs_; }
+        }
 
         macro_rules! integer {
             ($name:ident $oper:tt) => {
@@ -419,11 +488,16 @@ impl<'a> ConstantFolder<'a> {
         }
         integer!(BitOr |);
         integer!(BitAnd &);
+        integer!(BitXor ^);
         integer!(LShift <<);
         integer!(RShift >>);
 
         match (op, lhs, rhs) {
             (BinaryOp::Add, String(lhs), String(rhs)) => Ok(String(lhs + &rhs)),
+            (BinaryOp::Eq, lhs, rhs) => Ok(Constant::from(lhs == rhs)),
+            (BinaryOp::NotEq, lhs, rhs) => Ok(Constant::from(lhs != rhs)),
+            (BinaryOp::And, lhs, rhs) => Ok(if lhs.to_bool() { rhs } else { lhs }),
+            (BinaryOp::Or, lhs, rhs) => Ok(if lhs.to_bool() { lhs } else { rhs }),
             (op, lhs, rhs) => Err(self.error(format!("non-constant {:?}: {} {} {}", op, lhs, op, rhs)))
         }
     }
@@ -470,6 +544,20 @@ impl<'a> ConstantFolder<'a> {
                     }
                     Constant::String(result)
                 },
+                "defined" if self.defines.is_some() => {
+                    let defines = self.defines.unwrap();  // annoying, but keeps the match clean
+                    if args.len() != 1 {
+                        return Err(self.error("malformed defined() call"));
+                    }
+                    match args[0] {
+                        Expression::Base { ref unary, term: Term::Ident(ref ident), ref follow }
+                            if unary.is_empty() && follow.is_empty()
+                        => {
+                            Constant::Int(if defines.contains_key(ident) { 1 } else { 0 })
+                        }
+                        _ => return Err(self.error("malformed defined() call"))
+                    }
+                }
                 // other functions are no-goes
                 _ => return Err(self.error(format!("non-constant function call: {}", ident)))
             },
@@ -507,7 +595,7 @@ impl<'a> ConstantFolder<'a> {
         while let Some(ty) = idx {
             let location = self.location;
             if self.tree.is_none() {
-                return Err(self.error("cannot use idents during simple_evaluate"));
+                return Err(self.error("cannot reference variables in this context"));
             }
             let tree = self.tree.as_mut().unwrap();
             match constant_ident_lookup(tree, ty, &ident, must_be_static).map_err(|e| DMError::new(location, e.into_description()))? {

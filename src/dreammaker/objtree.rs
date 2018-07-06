@@ -8,7 +8,7 @@ use petgraph::visit::EdgeRef;
 use petgraph::Direction;
 use linked_hash_map::LinkedHashMap;
 
-use super::ast::{Expression, TypePath, PathOp, Prefab};
+use super::ast::{Expression, VarType, TypePath, PathOp, Prefab, Parameter};
 use super::constants::Constant;
 use super::{DMError, Location, Context};
 
@@ -19,18 +19,8 @@ pub type Vars = LinkedHashMap<String, Constant>;
 
 #[derive(Debug, Clone)]
 pub struct VarDeclaration {
-    pub is_static: bool,
-    pub is_const: bool,
-    pub is_tmp: bool,
-    pub type_path: TypePath,
+    pub var_type: VarType,
     pub location: Location,
-}
-
-impl VarDeclaration {
-    #[inline]
-    pub fn is_const_evaluable(&self) -> bool {
-        self.is_const || (!self.is_static && !self.is_tmp)
-    }
 }
 
 #[derive(Debug, Clone)]
@@ -58,6 +48,7 @@ pub struct ProcDeclaration {
 #[derive(Debug, Clone)]
 pub struct ProcValue {
     pub location: Location,
+    pub parameters: Vec<Parameter>,
 }
 
 #[derive(Debug, Clone)]
@@ -111,6 +102,17 @@ impl Type {
     #[inline]
     pub fn is_supertype_of(&self, child: &Type, objtree: &ObjectTree) -> bool {
         child.is_subtype_of(self, objtree)
+    }
+
+    pub fn get_value<'a>(&'a self, name: &str, objtree: &'a ObjectTree) -> Option<&'a VarValue> {
+        let mut current = Some(self);
+        while let Some(ty) = current {
+            if let Some(var) = ty.vars.get(name) {
+                return Some(&var.value);
+            }
+            current = objtree.parent_of(ty);
+        }
+        None
     }
 
     pub fn get_declaration<'a>(&'a self, name: &str, objtree: &'a ObjectTree) -> Option<&'a VarDeclaration> {
@@ -292,16 +294,18 @@ impl ObjectTree {
     // ------------------------------------------------------------------------
     // Finalization
 
-    pub(crate) fn finalize(&mut self, context: &Context) {
+    pub(crate) fn finalize(&mut self, context: &Context, sloppy: bool) {
         self.assign_parent_types(context);
-        super::constants::evaluate_all(context, self);
+        super::constants::evaluate_all(context, self, sloppy);
     }
 
     fn assign_parent_types(&mut self, context: &Context) {
         for (path, &type_idx) in self.types.iter() {
+            let mut location = self.graph.node_weight(type_idx).unwrap().location;
             let idx = if path == "/datum" {
                 NodeIndex::new(0)
             } else {
+                let mut parent_type_buf;
                 let parent_type = if path == "/atom" {
                     "/datum"
                 } else if path == "/turf" {
@@ -313,21 +317,43 @@ impl ObjectTree {
                 } else if path == "/mob" {
                     "/atom/movable"
                 } else {
-                    // TODO
-                    /*match type_.vars.get("parent_type") {
-                        Some(name) => name,
-                        None => */match path.rfind("/").unwrap() {
-                            0 => "/datum",
-                            idx => &path[..idx],
+                    let mut parent_type = match path.rfind("/").unwrap() {
+                        0 => "/datum",
+                        idx => &path[..idx],
+                    };
+                    if let Some(name) = self.graph.node_weight(type_idx).unwrap().vars.get("parent_type") {
+                        location = name.value.location;
+                        if let Some(expr) = name.value.expression.clone() {
+                            match ::constants::simple_evaluate(name.value.location, expr) {
+                                Ok(Constant::String(s)) => {
+                                    parent_type_buf = s;
+                                    parent_type = &parent_type_buf;
+                                }
+                                Ok(Constant::Prefab(Prefab { ref path, ref vars })) if vars.is_empty() => {
+                                    parent_type_buf = String::new();
+                                    for &(_, ref piece) in path.iter() {
+                                        parent_type_buf.push('/');
+                                        parent_type_buf.push_str(&piece);
+                                    }
+                                    parent_type = &parent_type_buf;
+                                }
+                                Ok(other) => {
+                                    context.register_error(DMError::new(location, format!("bad parent_type: {}", other)));
+                                }
+                                Err(e) => {
+                                    context.register_error(e);
+                                }
+                            }
                         }
-                    //}
+                    }
+                    parent_type
                 };
 
                 if let Some(&idx) = self.types.get(parent_type) {
                     idx
                 } else {
-                    context.register_error(DMError::new(Location::default(), format!("bad parent_type for {}: {}", path, parent_type)));
-                    continue;
+                    context.register_error(DMError::new(location, format!("bad parent type for {}: {}", path, parent_type)));
+                    NodeIndex::new(0)  // on bad parent_type, fall back to the root
                 }
             };
 
@@ -477,10 +503,12 @@ impl ObjectTree {
             },
             declaration: if is_declaration {
                 Some(VarDeclaration {
-                    is_static,
-                    is_const,
-                    is_tmp,
-                    type_path,
+                    var_type: VarType {
+                        is_static,
+                        is_const,
+                        is_tmp,
+                        type_path,
+                    },
                     location,
                 })
             } else {
@@ -489,11 +517,12 @@ impl ObjectTree {
         })))
     }
 
-    fn register_proc(&mut self, location: Location, parent: NodeIndex, name: &str, is_verb: Option<bool>) -> Result<Option<&mut TypeProc>, DMError> {
+    fn register_proc(&mut self, location: Location, parent: NodeIndex, name: &str, is_verb: Option<bool>, parameters: Vec<Parameter>) -> Result<Option<&mut TypeProc>, DMError> {
         let node = self.graph.node_weight_mut(parent).unwrap();
         Ok(Some(node.procs.entry(name.to_owned()).or_insert_with(|| TypeProc {
             value: ProcValue {
                 location,
+                parameters,
             },
             declaration: is_verb.map(|is_verb| ProcDeclaration {
                 location,
@@ -528,7 +557,7 @@ impl ObjectTree {
     }
 
     // an entry which is definitely a proc because an argument list is specified
-    pub fn add_proc<'a, I: Iterator<Item=&'a str>>(&mut self, location: Location, mut path: I, len: usize) -> Result<(), DMError> {
+    pub fn add_proc<'a, I: Iterator<Item=&'a str>>(&mut self, location: Location, mut path: I, len: usize, parameters: Vec<Parameter>) -> Result<(), DMError> {
         let (parent, mut proc_name) = self.get_from_path(location, &mut path, len)?;
         let mut is_verb = None;
         if is_proc_decl(proc_name) {
@@ -544,7 +573,7 @@ impl ObjectTree {
             return Err(DMError::new(location, "proc name must be a single identifier"))
         }
 
-        if let Some(type_proc) = self.register_proc(location, parent, proc_name, is_verb)? {
+        if let Some(type_proc) = self.register_proc(location, parent, proc_name, is_verb, parameters)? {
             type_proc.value.location = location;
             Ok(())
         } else {

@@ -120,10 +120,6 @@ pub fn register_builtins(tree: &mut ObjectTree) -> Result<(), DMError> {
         column: 1,
     };
 
-    macro_rules! ignore {
-        ($($x:tt)*) => {}
-    }
-
     macro_rules! entries {
         ($($($elem:ident)/ * $(($($arg:ident),*))* $(= $val:expr)*;)*) => {
             $(loop {
@@ -134,8 +130,9 @@ pub fn register_builtins(tree: &mut ObjectTree) -> Result<(), DMError> {
                     break;
                 )*
                 $(
-                    tree.add_proc(location, elems.iter().cloned(), elems.len() + 1)?;
-                    $(ignore!($arg);)*
+                    tree.add_proc(location, elems.iter().cloned(), elems.len() + 1, vec![$(
+                        Parameter { name: stringify!($arg).to_owned(), .. Default::default() }
+                    ),*])?;
                     break;
                 )*
                 tree.add_entry(location, elems.iter().cloned(), elems.len() + 1)?;
@@ -251,6 +248,11 @@ pub fn register_builtins(tree: &mut ObjectTree) -> Result<(), DMError> {
         var/vars;
 
         datum;
+        datum/proc/New();
+        datum/proc/Del();
+        datum/proc/Read(/*savefile*/F);
+        datum/proc/Topic(href, href_list);
+        datum/proc/Write(/*savefile*/F);
 
         atom/parent_type = path!(/datum);
         atom/var/alpha;
@@ -284,23 +286,35 @@ pub fn register_builtins(tree: &mut ObjectTree) -> Result<(), DMError> {
         atom/var/opacity;
         atom/var/overlays;
         atom/var/override;
-        atom/var/parent_type;
         atom/var/pixel_x;
         atom/var/pixel_y;
         atom/var/pixel_w;
         atom/var/pixel_z;
         atom/var/plane;
         atom/var/suffix;
-        atom/var/tag;
         atom/var/text;
         atom/var/transform;
-        atom/var/type;
         atom/var/underlays;
-        atom/var/vars;
         atom/var/verbs;
         atom/var/x;
         atom/var/y;
         atom/var/z;
+        atom/proc/Click(location, control, params);
+        atom/proc/DblClick(location, control, params);
+        atom/proc/Enter(/*atom/movable*/O, /*atom*/oldloc);
+        atom/proc/Entered(/*atom/movable*/Obj, /*atom*/OldLoc);
+        atom/proc/Exit(/*atom/movable*/O, /*atom*/newloc);
+        atom/proc/Exited(/*atom/movable*/Obj, /*atom*/newloc);
+        atom/proc/MouseDown(location, control, params);
+        atom/proc/MouseDrag(over_object, src_location, over_location, src_control, over_control, params);
+        atom/proc/MouseDrop(over_object, src_location, over_location, src_control, over_control, params);
+        atom/proc/MouseEntered(location, control, params);
+        atom/proc/MouseExited(location, control, params);
+        atom/proc/MouseMove(location, control, params);
+        atom/proc/MouseUp(location, control, params);
+        atom/proc/MouseWheel(delta_x, delta_y, location, control, params);
+        atom/New(loc);
+        atom/proc/Stat();
 
         atom/movable;
         atom/movable/var/animate_movement;
@@ -314,12 +328,24 @@ pub fn register_builtins(tree: &mut ObjectTree) -> Result<(), DMError> {
         atom/movable/var/step_size;
         atom/movable/var/step_x;
         atom/movable/var/step_y;
+        atom/movable/proc/Bump(/*atom*/Obstacle);
+        atom/movable/proc/Cross(/*atom/movable*/O);
+        atom/movable/proc/Crossed(/*atom/movable*/O);
+        atom/movable/proc/Move(NewLoc, Dir/*=0*/, step_x/*=0*/, step_y/*=0*/);
+        atom/movable/proc/Uncross(/*atom/movable*/O);
+        atom/movable/proc/Uncrossed(/*atom/movable*/O);
 
         area/parent_type = path!(/atom);
+        area/layer = int!(1);
+
         turf/parent_type = path!(/atom);
+        turf/layer = int!(2);
+
         obj/parent_type = path!(/atom/movable);
+        obj/layer = int!(3);
 
         mob/parent_type = path!(/atom/movable);
+        mob/layer = int!(4);
         mob/var/ckey;
         mob/var/client/client;
         mob/var/list/group;
@@ -328,6 +354,8 @@ pub fn register_builtins(tree: &mut ObjectTree) -> Result<(), DMError> {
         mob/var/see_invisible;
         mob/var/see_in_dark;
         mob/var/sight;
+        mob/proc/Login();
+        mob/proc/Logout();
 
         world;
         var/static/world/world;
@@ -411,6 +439,37 @@ pub fn register_builtins(tree: &mut ObjectTree) -> Result<(), DMError> {
         client/var/verbs;
         client/var/view;
         client/var/virtual_eye;
+        client/proc/AllowUpload(filename, filelength);
+        client/proc/Center();
+        client/proc/CheckPassport(passport_identifier);
+        client/proc/Click(object, location, control, params);
+        client/proc/Command(command);
+        client/proc/DblClick(object, location, control, params);
+        client/Del();
+        client/proc/East();
+        client/proc/Export(file);
+        client/proc/Import(Query);
+        client/proc/IsByondMember();
+        client/proc/MouseDown(object, location, control, params);
+        client/proc/MouseDrag(src_object, over_object, src_location, over_location, src_control, over_control, params);
+        client/proc/MouseDrop(over_object, src_location, over_location, src_control, over_control, params);
+        client/proc/MouseEntered(object, location, control, params);
+        client/proc/MouseExited(object, location, control, params);
+        client/proc/MouseMove(object, location, control, params);
+        client/proc/MouseUp(object, location, control, params);
+        client/proc/MouseWheel(object, delta_x, delta_y, location, control, params);
+        client/proc/Move(loc, dir);
+        client/New();
+        client/proc/North();
+        client/proc/Northeast();
+        client/proc/Northwest();
+        client/proc/SendPage(msg, recipient, options);
+        client/proc/South();
+        client/proc/Southeast();
+        client/proc/Southwest();
+        client/proc/Stat();
+        client/Topic(href, href_list, hsrc);
+        client/proc/West();
 
         sound;
         sound/var/file;
@@ -429,6 +488,24 @@ pub fn register_builtins(tree: &mut ObjectTree) -> Result<(), DMError> {
         sound/var/z = int!(0);
         sound/var/falloff = int!(1);
         sound/New(file, repeat, wait, channel, volume);
+
+        icon;
+        icon/proc/Blend(icon, function/*=ICON_ADD*/, x/*=1*/, y/*=1*/);
+        icon/proc/Crop(x1, y1, x2, y2);
+        icon/proc/DrawBox(rgb, x1, y1, x2/*=x1*/, y2/*=y1*/);
+        icon/proc/Flip(dir);
+        icon/proc/GetPixel(x, y, icon_state, dir/*=0*/, frame/*=0*/, moving/*=-1*/);
+        icon/proc/Width();
+        icon/proc/IconStates(mode/*=0*/);
+        icon/proc/Insert(new_icon, icon_state, dir, frame, moving, delay);
+        icon/proc/MapColors(/*...*/);
+        icon/New(icon, icon_state, dir, frame, moving);
+        icon/proc/Scale(width, height);
+        icon/proc/SetIntensity(r, g/*=r*/, b/*=r*/);
+        icon/proc/Shift(dir, offset, wrap/*=0*/);
+        icon/proc/SwapColor(old_rgba, new_rgba);
+        icon/proc/Turn(angle);
+        icon/proc/Height();
 
         matrix;
         matrix/var/a;
@@ -454,6 +531,7 @@ pub fn register_builtins(tree: &mut ObjectTree) -> Result<(), DMError> {
         exception/var/line;
         exception/New(name, file, line);
 
+        regex;
         regex/var/name;
         regex/var/flags;
         regex/var/text;
@@ -465,6 +543,55 @@ pub fn register_builtins(tree: &mut ObjectTree) -> Result<(), DMError> {
         regex/proc/Find(text, start, end);
         regex/proc/Replace(text, rep, start, end);
 
+        database;
+        database/proc/Close();
+        database/proc/Error();
+        database/proc/ErrorMsg();
+        database/proc/Open(filename);
+        database/proc/New(filename);
+
+        database_query/proc/Add(text, item1, item2 /*...*/);
+        database_query/proc/Close();
+        database_query/proc/Columns(column);
+        database_query/proc/Error();
+        database_query/proc/ErrorMsg();
+        database_query/proc/Execute(database);
+        database_query/proc/GetColumn(column);
+        database_query/proc/GetRowData();
+        database_query/proc/New(text, item1, item2 /*...*/);
+        database_query/proc/NextRow();
+        database_query/proc/Reset();
+        database_query/proc/RowsAffected();
+
+        image;
+        image/var/alpha;
+        image/var/appearance;
+        image/var/appearance_flags;
+        image/var/blend_mode;
+        image/var/color;
+        image/var/icon/icon;
+        image/var/icon_state;
+        image/var/text;
+        image/var/dir;
+        image/var/underlays;
+        image/var/overlays;
+        image/var/atom/loc;
+        image/var/layer = int!(5);
+        image/var/maptext;
+        image/var/maptext_width;
+        image/var/maptext_height;
+        image/var/maptext_x;
+        image/var/maptext_y;
+        image/var/pixel_x;
+        image/var/pixel_y;
+        image/var/pixel_w;
+        image/var/pixel_z;
+        image/var/plane;
+        image/var/x;
+        image/var/y;
+        image/var/z;
+        image/var/override;
+        image/var/transform;
         mutable_appearance/parent_type = path!(/image);
     };
 

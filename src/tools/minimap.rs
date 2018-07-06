@@ -205,7 +205,10 @@ pub fn generate(
             // OOB handling
             if loc.0 < 0 {
                 rect.0 += (-loc.0) as u32;
-                rect.2 -= (-loc.0) as u32;
+                match rect.2.checked_sub((-loc.0) as u32) {
+                    Some(s) => rect.2 = s,
+                    None => continue 'atom  // out of the viewport
+                }
                 loc.0 = 0;
             }
             while loc.0 + rect.2 as i32 > map_image.info.width as i32 {
@@ -214,7 +217,10 @@ pub fn generate(
             }
             if loc.1 < 0 {
                 rect.1 += (-loc.1) as u32;
-                rect.3 -= (-loc.1) as u32;
+                match rect.3.checked_sub((-loc.1) as u32) {
+                    Some(s) => rect.3 = s,
+                    None => continue 'atom  // out of the viewport
+                }
                 loc.1 = 0;
             }
             while loc.1 + rect.3 as i32 > map_image.info.height as i32 {
@@ -408,7 +414,10 @@ fn layer_of(objtree: &ObjectTree, atom: &Atom) -> i32 {
         match atom.get_var("layer", objtree) {
             &Constant::Int(i) => (i % 1000) * 1000,
             &Constant::Float(f) => ((f % 1000.) * 1000.) as i32,
-            other => panic!("not a layer: {:?}", other),
+            other => {
+                eprintln!("not a layer: {:?} on {:?}", other, atom.type_.path);
+                2_000
+            }
         }
     }
 }

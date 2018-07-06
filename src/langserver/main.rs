@@ -9,6 +9,7 @@
 extern crate url;
 extern crate serde;
 extern crate serde_json;
+#[macro_use] extern crate serde_derive;
 extern crate petgraph;
 extern crate languageserver_types as langserver;
 extern crate jsonrpc_core as jsonrpc;
@@ -18,9 +19,10 @@ extern crate dreammaker as dm;
 mod io;
 mod document;
 mod symbol_search;
+mod extras;
 
 use std::path::PathBuf;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 
 use url::Url;
 use jsonrpc::{Request, Call, Response, Output};
@@ -28,6 +30,8 @@ use langserver::MessageType;
 use petgraph::visit::IntoNodeReferences;
 
 fn main() {
+    std::env::set_var("RUST_BACKTRACE", "1");
+
     eprintln!("dm-langserver {}  Copyright (C) 2017-2018  Tad Hardesty", env!("CARGO_PKG_VERSION"));
     eprintln!("This program comes with ABSOLUTELY NO WARRANTY. This is free software,");
     eprintln!("and you are welcome to redistribute it under the conditions of the GNU");
@@ -114,8 +118,25 @@ impl<'a, R: io::RequestRead, W: io::ResponseWrite> Engine<'a, R, W> {
         )
     }
 
+    fn show_status<S>(&mut self, message: S) where
+        S: Into<String>
+    {
+        self.issue_notification::<extras::WindowStatus>(extras::WindowStatusParams {
+            environment: None,
+            tasks: vec![message.into()],
+        });
+    }
+
     fn file_url(&self, file: dm::FileId) -> Result<Url, jsonrpc::Error> {
         path_to_url(self.root.join(self.context.file_path(file)))
+    }
+
+    fn location_link(&self, loc: dm::Location) -> String {
+        if loc.file == dm::FileId::builtins() {
+            String::new()
+        } else {
+            format!("file:{}#{}", self.root.join(self.context.file_path(loc.file)).display().to_string().replace("\\", "/"), loc.line)
+        }
     }
 
     fn convert_location(&self, loc: dm::Location, one: &str, two: &str, three: &str) -> Result<langserver::Location, jsonrpc::Error> {
@@ -139,14 +160,30 @@ impl<'a, R: io::RequestRead, W: io::ResponseWrite> Engine<'a, R, W> {
 
     fn parse_environment(&mut self, environment: PathBuf) -> Result<(), jsonrpc::Error> {
         // handle the parsing
-        let file_name = environment.file_name().unwrap_or("..".as_ref()).to_string_lossy();
         eprintln!("environment: {}", environment.display());
+        if let Some(stem) = environment.file_stem() {
+            self.issue_notification::<extras::WindowStatus>(extras::WindowStatusParams {
+                environment: Some(stem.to_string_lossy().into_owned()),
+                tasks: vec!["loading".to_owned()],
+            })
+        } else {
+            self.show_status("loading");
+        }
 
         let ctx = self.context;
         let mut pp = match dm::preprocessor::Preprocessor::new(ctx, environment.clone()) {
             Ok(pp) => pp,
             Err(err) => {
-                self.show_message(MessageType::Error, format!("Error loading {}", file_name));
+                use std::error::Error;
+                self.issue_notification::<langserver::notification::PublishDiagnostics>(
+                    langserver::PublishDiagnosticsParams {
+                        uri: path_to_url(environment)?,
+                        diagnostics: vec![langserver::Diagnostic {
+                            message: err.description().to_owned(),
+                            .. Default::default()
+                        }],
+                    }
+                );
                 eprintln!("{:?}", err);
                 return Ok(());
             }
@@ -155,7 +192,7 @@ impl<'a, R: io::RequestRead, W: io::ResponseWrite> Engine<'a, R, W> {
         self.objtree = dm::parser::parse(ctx, dm::indents::IndentProcessor::new(ctx, &mut pp));
         pp.finalize();
         self.preprocessor = Some(pp);
-        self.show_message(MessageType::Info, format!("Loaded {}", file_name));
+        self.issue_notification::<extras::WindowStatus>(Default::default());
 
         // initial diagnostics pump
         let mut map: HashMap<_, Vec<_>> = HashMap::new();
@@ -329,7 +366,7 @@ handle_method_call! {
         }
 
         for (idx, ty) in self.objtree.graph.node_references() {
-            if query.matches_type(&ty.name, &ty.path) {
+            if query.matches_type(&ty.name, &ty.path) && idx.index() != 0 {
                 results.push(SymbolInformation {
                     name: ty.name.clone(),
                     kind: SymbolKind::Class,
@@ -382,6 +419,7 @@ handle_method_call! {
         let path = url_to_path(params.text_document.uri)?;
         let contents = self.docs.read(&path).map_err(invalid_request)?;
 
+        // TODO: cache this junk
         let preprocessor = match self.preprocessor {
             Some(ref pp) => pp,
             None => { eprintln!("no preprocessor"); return Ok(None); }
@@ -406,17 +444,135 @@ handle_method_call! {
             parser.run();
         }
 
-        Some(Hover {
-            range: None,
-            contents: HoverContents::Markup(MarkupContent {
-                kind: MarkupKind::Markdown,
-                value: format!("```\n{}\n```", annotations.get_location(dm::Location {
-                    file: file_id,
-                    line: params.position.line as u32 + 1,
-                    column: params.position.character as u16 + 1,
-                }).map(|(_, x)| format!("{:?}", x)).collect::<Vec<_>>().join("\n")),
-            }),
-        })
+        let location = dm::Location {
+            file: file_id,
+            line: params.position.line as u32 + 1,
+            column: params.position.character as u16 + 1,
+        };
+        let mut results = Vec::new();
+        for (_range, annotation) in annotations.get_location(location) {
+            use dm::annotation::Annotation;
+            #[cfg(debug_assertions)] {
+                results.push(format!("{:?}", annotation));
+            }
+            match annotation {
+                Annotation::Variable(path) if !path.is_empty() => {
+                    let objtree = &self.objtree;
+                    let mut current = objtree.root();
+                    let (last, most) = path.split_last().unwrap();
+                    for part in most {
+                        if part == "var" { break }
+                        if let Some(child) = current.child(part, objtree) {
+                            current = child;
+                        } else {
+                            break;
+                        }
+                    }
+
+                    let mut infos = VecDeque::new();
+                    let mut next = Some(current);
+                    while let Some(current) = next {
+                        if let Some(var) = current.vars.get(last) {
+                            let constant = if let Some(ref constant) = var.value.constant {
+                                format!("  \n= `{}`", constant)
+                            } else {
+                                String::new()
+                            };
+                            let path = if current.path.is_empty() {
+                                "(global)"
+                            } else {
+                                &current.path
+                            };
+                            infos.push_front(format!("[{}]({}){}", path, self.location_link(var.value.location), constant));
+                            if let Some(ref decl) = var.declaration {
+                                let mut declaration = String::new();
+                                declaration.push_str("var");
+                                if decl.var_type.is_static {
+                                    declaration.push_str("/static");
+                                }
+                                if decl.var_type.is_const {
+                                    declaration.push_str("/const");
+                                }
+                                if decl.var_type.is_tmp {
+                                    declaration.push_str("/tmp");
+                                }
+                                for (_, bit) in decl.var_type.type_path.iter() {
+                                    declaration.push('/');
+                                    declaration.push_str(&bit);
+                                }
+                                declaration.push_str("/**");
+                                declaration.push_str(last);
+                                declaration.push_str("**");
+                                infos.push_front(declaration);
+                            }
+                        }
+                        next = current.parent_type(objtree);
+                    }
+                    if !infos.is_empty() {
+                        results.push(infos.into_iter().collect::<Vec<_>>().join("\n\n"));
+                    }
+                }
+                Annotation::ProcHeader(path) if !path.is_empty() => {
+                    let objtree = &self.objtree;
+                    let mut current = objtree.root();
+                    let (last, most) = path.split_last().unwrap();
+                    for part in most {
+                        if part == "proc" || part == "verb" { break }
+                        if let Some(child) = current.child(part, objtree) {
+                            current = child;
+                        } else {
+                            break;
+                        }
+                    }
+
+                    let mut infos = VecDeque::new();
+                    let mut next = Some(current);
+                    while let Some(current) = next {
+                        if let Some(proc) = current.procs.get(last) {
+                            let path = if current.path.is_empty() {
+                                "(global)"
+                            } else {
+                                &current.path
+                            };
+                            let mut message = format!("[{}]({})  \n{}(", path, self.location_link(proc.value.location), last);
+                            let mut first = true;
+                            for each in proc.value.parameters.iter() {
+                                use std::fmt::Write;
+                                if first {
+                                    first = false;
+                                } else {
+                                    message.push_str(", ");
+                                }
+                                let _ = write!(message, "{}", each);
+                            }
+                            message.push_str(")");
+                            infos.push_front(message);
+                            if let Some(ref decl) = proc.declaration {
+                                let mut declaration = String::new();
+                                declaration.push_str(if decl.is_verb { "verb" } else { "proc" });
+                                declaration.push_str("/**");
+                                declaration.push_str(last);
+                                declaration.push_str("**");
+                                infos.push_front(declaration);
+                            }
+                        }
+                        next = current.parent_type(objtree);
+                    }
+                    if !infos.is_empty() {
+                        results.push(infos.into_iter().collect::<Vec<_>>().join("\n\n"));
+                    }
+                }
+                _ => {}
+            }
+        }
+        if results.is_empty() {
+            None
+        } else {
+            Some(Hover {
+                range: None,
+                contents: HoverContents::Array(results.into_iter().map(MarkedString::String).collect()),
+            })
+        }
     }
 }
 
@@ -441,7 +597,7 @@ handle_notification! {
         if let Some(environment) = environment {
             self.parse_environment(environment)?;
         } else {
-            self.show_message(MessageType::Error, "No DME found, language service not available.");
+            self.show_status("no .dme file");
         }
     }
 

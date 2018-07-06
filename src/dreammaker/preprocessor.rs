@@ -213,11 +213,11 @@ impl Ifdef {
     fn new(location: Location, active: bool) -> Ifdef {
         Ifdef { location, active, chain_active: active }
     }
-    fn else_(self) -> Ifdef {
-        Ifdef { location: self.location, active: !self.active, chain_active: true }
+    fn else_(self, location: Location) -> Ifdef {
+        Ifdef { location, active: !self.chain_active, chain_active: true }
     }
-    fn else_if(self, active: bool) -> Ifdef {
-        Ifdef { location: self.location, active, chain_active: self.chain_active || active }
+    fn else_if(self, location: Location, active: bool) -> Ifdef {
+        Ifdef { location, active: !self.chain_active && active, chain_active: self.chain_active || active }
     }
 }
 
@@ -225,17 +225,23 @@ impl Ifdef {
 /// C-like preprocessor for DM. Expands directives and macro invocations.
 pub struct Preprocessor<'ctx> {
     context: &'ctx Context,
-
     env_file: PathBuf,
+
+    include_stack: IncludeStack<'ctx>,
+    last_input_loc: Location,
+    output: VecDeque<Token>,
+    ifdef_stack: Vec<Ifdef>,
+    ifdef_history: IntervalTree<Location, bool>,
+
     history: DefineHistory,
     defines: DefineMap,
     maps: Vec<PathBuf>,
     skins: Vec<PathBuf>,
-    include_stack: IncludeStack<'ctx>,
-    ifdef_stack: Vec<Ifdef>,
+    scripts: Vec<PathBuf>,
 
-    last_input_loc: Location,
-    output: VecDeque<Token>,
+    last_printable_input_loc: Location,
+    danger_idents: HashMap<String, Location>,
+    in_interp_string: u32,
 }
 
 impl<'ctx> HasLocation for Preprocessor<'ctx> {
@@ -257,9 +263,14 @@ impl<'ctx> Preprocessor<'ctx> {
             defines: Default::default(),
             maps: Default::default(),
             skins: Default::default(),
+            scripts: Default::default(),
             ifdef_stack: Default::default(),
+            ifdef_history: Default::default(),
             last_input_loc: Default::default(),
+            last_printable_input_loc: Default::default(),
             output: Default::default(),
+            danger_idents: Default::default(),
+            in_interp_string: 0,
         };
         super::builtins::default_defines(&mut pp.defines);
         Ok(pp)
@@ -288,6 +299,11 @@ impl<'ctx> Preprocessor<'ctx> {
         &self.history
     }
 
+    /// Access the ifdef history.
+    pub fn ifdef_history(&self) -> &IntervalTree<Location, bool> {
+        &self.ifdef_history
+    }
+
     /// Branch a child preprocessor from this preprocessor's historic state at
     /// the start of the given file.
     pub fn branch_at_file<'ctx2>(&self, file: FileId, context: &'ctx2 Context) -> Preprocessor<'ctx2> {
@@ -302,9 +318,14 @@ impl<'ctx> Preprocessor<'ctx> {
             defines,
             maps: Default::default(),
             skins: Default::default(),
+            scripts: Default::default(),
             ifdef_stack: Default::default(),  // should be fine
+            ifdef_history: Default::default(),
             last_input_loc: location,
+            last_printable_input_loc: location,
             output: Default::default(),
+            danger_idents: Default::default(),
+            in_interp_string: 0,
         }
     }
 
@@ -328,7 +349,7 @@ impl<'ctx> Preprocessor<'ctx> {
     }
 
     // ------------------------------------------------------------------------
-    // Internal utilities
+    // Macro definition handling
 
     fn in_environment(&self) -> bool {
         for include in self.include_stack.stack.iter().rev() {
@@ -346,26 +367,76 @@ impl<'ctx> Preprocessor<'ctx> {
         }
     }
 
+    fn move_to_history(&mut self, name: String, previous: (Location, Define)) {
+        self.history.insert(range(previous.0, self.last_input_loc), (name, previous.1));
+    }
+
+    // ------------------------------------------------------------------------
+    // Conditional compilation handling
+
     fn is_disabled(&self) -> bool {
         self.ifdef_stack.iter().any(|x| !x.active)
+    }
+
+    fn pop_ifdef(&mut self) -> Option<Ifdef> {
+        self.ifdef_stack.pop().map(|ifdef| {
+            self.ifdef_history.insert(range(ifdef.location, self.last_input_loc), ifdef.active);
+            ifdef
+        })
+    }
+
+    fn evaluate_inner(&mut self) -> Result<bool, DMError> {
+        // pump real_next to fill output until we get a real newline on input
+        let start = self.last_input_loc;
+        while let Some(tok) = self.inner_next() {
+            self.last_input_loc = tok.location;
+
+            if let Token::Punct(Punctuation::Newline) = tok.token {
+                break
+            }
+
+            if let Err(e) = self.real_next(tok.token, true) {
+                self.context.register_error(e);
+            }
+        }
+
+        let mut parser = ::parser::Parser::new(self.context,
+            self.output.drain(..).map(|token| LocatedToken::new(start, token)));
+        parser.set_fallback_location(start);
+        let expr = parser.expression();
+        let expr = parser.require(expr)?;
+        Ok(::constants::preprocessor_evaluate(start, expr, &self.defines)?.to_bool())
+    }
+
+    fn evaluate(&mut self) -> bool {
+        // always succeed in order to avoid phantom "unmatched #endif" messages
+        match self.evaluate_inner() {
+            Ok(value) => value,
+            Err(err) => {
+                self.context.register_error(err);
+                false
+            }
+        }
+    }
+
+    // ------------------------------------------------------------------------
+    // Internal utilities
+
+    fn check_danger_ident(&mut self, name: &str, kind: &str) {
+        if let Some(loc) = self.danger_idents.get(name) {
+            self.context.register_error(DMError::new(*loc, format!(
+                "macro {:?} used immediately before being {}:\n\
+                https://secure.byond.com/forum/?post=2072419", name, kind
+            )).set_severity(Severity::Warning));
+        }
     }
 
     fn inner_next(&mut self) -> Option<LocatedToken> {
         self.include_stack.next()
     }
 
-    fn evaluate(&mut self) -> Result<bool, DMError> {
-        // TODO: read until Newline and evaluate that expression
-        //println!("#if {:?}", self.location());
-        Ok(false)
-    }
-
-    fn move_to_history(&mut self, name: String, previous: (Location, Define)) {
-        self.history.insert(range(previous.0, self.last_input_loc), (name, previous.1));
-    }
-
     #[allow(unreachable_code)]
-    fn real_next(&mut self, read: Token) -> Result<(), DMError> {
+    fn real_next(&mut self, read: Token, inside_condition: bool) -> Result<(), DMError> {
         let mut _last_expected_loc = self.last_input_loc;
         macro_rules! next {
             () => {
@@ -384,6 +455,11 @@ impl<'ctx> Preprocessor<'ctx> {
             }
         }
 
+        const ALL_DIRECTIVES: &[&str] = &[
+            "if", "ifdef", "ifndef", "elif", "else", "endif",
+            "include", "define", "undef", "warn", "error",
+        ];
+        let disabled = !inside_condition && self.is_disabled();
         match read {
             Token::Punct(Punctuation::Hash) => {
                 // preprocessor directive, next thing ought to be an ident
@@ -391,13 +467,13 @@ impl<'ctx> Preprocessor<'ctx> {
                 match &ident[..] {
                     // ifdefs
                     "endif" => {
-                        self.ifdef_stack.pop().ok_or_else(||
+                        self.pop_ifdef().ok_or_else(||
                             DMError::new(self.last_input_loc, "unmatched #endif"))?;
                     }
                     "else" => {
-                        let last = self.ifdef_stack.pop().ok_or_else(||
+                        let last = self.pop_ifdef().ok_or_else(||
                             DMError::new(self.last_input_loc, "unmatched #else"))?;
-                        self.ifdef_stack.push(last.else_());
+                        self.ifdef_stack.push(last.else_(self.last_input_loc));
                     }
                     "ifdef" => {
                         expect_token!((define_name) = Token::Ident(define_name, _));
@@ -412,18 +488,20 @@ impl<'ctx> Preprocessor<'ctx> {
                         self.ifdef_stack.push(Ifdef::new(self.last_input_loc, enabled));
                     }
                     "if" => {
-                        let enabled = self.evaluate()?;
+                        let enabled = self.evaluate();
                         self.ifdef_stack.push(Ifdef::new(self.last_input_loc, enabled));
                     }
-                    "elseif" => {
-                        let last = self.ifdef_stack.pop().ok_or_else(||
-                            DMError::new(self.last_input_loc, "unmatched #elseif"))?;
-                        let enabled = self.evaluate()?;
-                        self.ifdef_stack.push(last.else_if(enabled));
+                    "elif" => {
+                        let last = self.pop_ifdef().ok_or_else(||
+                            DMError::new(self.last_input_loc, "unmatched #elif"))?;
+                        let enabled = self.evaluate();
+                        self.ifdef_stack.push(last.else_if(self.last_input_loc, enabled));
                     }
+                    // --------------------------------------------------------
                     // anything other than ifdefs may be ifdef'd out
-                    _ if self.is_disabled() => {}
+                    // --------------------------------------------------------
                     // include searches relevant paths for files
+                    "include" if disabled => {}
                     "include" => {
                         expect_token!((path) = Token::String(path));
                         expect_token!(() = Token::Punct(Punctuation::Newline));
@@ -440,10 +518,11 @@ impl<'ctx> Preprocessor<'ctx> {
                             if !each.exists() { continue }
                             // Wacky construct is used to let go of the borrow
                             // of `each` so it can be used in the second half.
-                            enum FileType { DMM, DMF, DM }
+                            enum FileType { DMM, DMF, DMS, DM }
                             match match each.extension().and_then(|s| s.to_str()) {
                                 Some("dmm") => FileType::DMM,
                                 Some("dmf") => FileType::DMF,
+                                Some("dms") => FileType::DMS,
                                 Some("dm") => FileType::DM,
                                 Some(ext) => {
                                     self.context.register_error(DMError::new(self.last_input_loc, format!("unknown extension {:?}", ext)));
@@ -456,8 +535,15 @@ impl<'ctx> Preprocessor<'ctx> {
                             } {
                                 FileType::DMM => self.maps.push(each),
                                 FileType::DMF => self.skins.push(each),
+                                FileType::DMS => self.scripts.push(each),
                                 FileType::DM => match Include::new(self.context, each) {
-                                    Ok(include) => self.include_stack.stack.push(include),
+                                    Ok(include) => {
+                                        // A phantom newline keeps the include
+                                        // directive being indented from making
+                                        // the first line of the file indented.
+                                        self.output.push_back(Token::Punct(Punctuation::Newline));
+                                        self.include_stack.stack.push(include);
+                                    }
                                     Err(e) => self.context.register_error(DMError::new(self.last_input_loc,
                                         "failed to open file").set_cause(e)),
                                 },
@@ -467,9 +553,11 @@ impl<'ctx> Preprocessor<'ctx> {
                         return Err(self.error("failed to find file"));
                     }
                     // both constant and function defines
+                    "define" if disabled => {}
                     "define" => {
                         expect_token!((define_name, ws) = Token::Ident(define_name, ws));
                         let define_name_loc = _last_expected_loc;
+                        self.check_danger_ident(&define_name, "defined");
                         let mut params = Vec::new();
                         let mut subst = Vec::new();
                         let mut variadic = false;
@@ -528,14 +616,16 @@ impl<'ctx> Preprocessor<'ctx> {
                                     self.context.register_error(DMError::new(define_name_loc,
                                         format!("macro redefined: {}", define_name)).set_severity(Severity::Warning));
                                     self.context.register_error(DMError::new(previous_loc,
-                                        "previous definition").set_severity(Severity::Info));
+                                        format!("previous definition of {}", define_name)).set_severity(Severity::Info));
                                 }
                             }
                         }
                     }
+                    "undef" if disabled => {}
                     "undef" => {
                         expect_token!((define_name) = Token::Ident(define_name, _));
                         let define_name_loc = _last_expected_loc;
+                        self.check_danger_ident(&define_name, "undefined");
                         expect_token!(() = Token::Punct(Punctuation::Newline));
                         if let Some(previous) = self.defines.remove(&define_name) {
                             self.move_to_history(define_name, previous);
@@ -545,26 +635,57 @@ impl<'ctx> Preprocessor<'ctx> {
                             ).set_severity(Severity::Warning));
                         }
                     }
-                    "warning" | "warn" => {
+                    "warn" if disabled => {}
+                    "warn" => {
                         expect_token!((text) = Token::String(text));
                         self.context.register_error(DMError::new(self.last_input_loc, format!("#{} {}", ident, text))
                             .set_severity(Severity::Warning));
                     }
+                    "error" if disabled => {}
                     "error" => {
                         expect_token!((text) = Token::String(text));
                         self.context.register_error(DMError::new(self.last_input_loc, format!("#{} {}", ident, text)));
                     }
                     // none of this other stuff should even exist
-                    _ => return Err(DMError::new(self.last_input_loc, format!("unknown directive: #{}", ident)))
+                    other => {
+                        let mut meant = "";
+                        for each in ALL_DIRECTIVES {
+                            if other.starts_with(each) && each.len() > meant.len() {
+                                meant = each;
+                            }
+                        }
+                        return Err(DMError::new(self.last_input_loc, format!("unknown directive: #{}{}{}", ident,
+                            if !meant.is_empty() { ", did you mean #" } else { "" }, meant)));
+                    }
                 }
                 // yield a newline
                 self.output.push_back(Token::Punct(Punctuation::Newline));
                 return Ok(());
             }
             // anything other than directives may be ifdef'd out
-            _ if self.is_disabled() => return Ok(()),
+            _ if disabled => return Ok(()),
             // identifiers may be macros
             Token::Ident(ref ident, _) if ident != self.include_stack.top_no_expand() => {
+                // lint for BYOND bug
+                if self.in_interp_string > 0 {
+                    self.danger_idents.insert(ident.clone(), self.last_input_loc);
+                }
+
+                // substitute special macros
+                if ident == "__FILE__" {
+                    for include in self.include_stack.stack.iter().rev() {
+                        if let Include::File { ref path, .. } = *include {
+                            self.output.push_back(Token::String(path.display().to_string()));
+                            return Ok(());
+                        }
+                    }
+                    self.output.push_back(Token::String(String::new()));
+                    return Ok(());
+                } else if ident == "__LINE__" {
+                    self.output.push_back(Token::Int(self.last_input_loc.line as i32));
+                    return Ok(());
+                }
+
                 // if it's a define, perform the substitution
                 match self.defines.get(ident).cloned() { // TODO
                     Some((_, Define::Constant { subst })) => {
@@ -711,6 +832,8 @@ impl<'ctx> Preprocessor<'ctx> {
                     None => {}
                 }
             }
+            Token::InterpStringBegin(_) => self.in_interp_string += 1,
+            Token::InterpStringEnd(_) => self.in_interp_string -= 1,
             // everything else is itself
             _ => {}
         }
@@ -732,14 +855,24 @@ impl<'ctx> Iterator for Preprocessor<'ctx> {
             }
 
             if let Some(tok) = self.inner_next() {
+                // linting for https://secure.byond.com/forum/?post=2072419
+                if !tok.token.is_whitespace() && tok.token != Token::Punct(Punctuation::Hash) {
+                    if tok.location.file != self.last_printable_input_loc.file ||
+                        tok.location.line > self.last_printable_input_loc.line
+                    {
+                        self.danger_idents.clear();
+                    }
+                    self.last_printable_input_loc = tok.location;
+                }
+
+                // update last_input_loc and attempt to process the input token
                 self.last_input_loc = tok.location;
-                if let Err(e) = self.real_next(tok.token) {
+                if let Err(e) = self.real_next(tok.token, false) {
                     self.context.register_error(e);
                 }
             } else {
-                while let Some(ifdef) = self.ifdef_stack.pop() {
-                    self.context.register_error(DMError::new(ifdef.location, "unterminated #if/#ifdef")
-                        .set_severity(Severity::Warning));
+                while let Some(ifdef) = self.pop_ifdef() {
+                    self.context.register_error(DMError::new(ifdef.location, "unterminated #if/#ifdef"));
                 }
                 return None;
             }

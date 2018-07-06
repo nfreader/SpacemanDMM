@@ -36,6 +36,8 @@ pub struct Context {
     reverse_files: RefCell<HashMap<PathBuf, FileId>>,
     /// A list of errors, warnings, and other diagnostics generated.
     errors: RefCell<Vec<DMError>>,
+    /// Severity at and above which errors will be printed immediately.
+    print_severity: Option<Severity>,
 }
 
 impl Context {
@@ -76,12 +78,23 @@ impl Context {
 
     /// Push an error or other diagnostic to the context.
     pub fn register_error(&self, error: DMError) {
+        if let Some(severity) = self.print_severity {
+            if error.severity <= severity {
+                let stderr = io::stderr();
+                self.pretty_print_error(&mut stderr.lock(), &error).expect("error writing to stderr");
+            }
+        }
         self.errors.borrow_mut().push(error);
     }
 
     /// Access the list of diagnostics generated so far.
     pub fn errors(&self) -> Ref<[DMError]> {
         Ref::map(self.errors.borrow(), |x| &**x)
+    }
+
+    /// Set a severity at and above which errors will be printed immediately.
+    pub fn set_print_severity(&mut self, print_severity: Option<Severity>) {
+        self.print_severity = print_severity;
     }
 
     /// Pretty-print a `DMError` to the given output.
@@ -96,14 +109,27 @@ impl Context {
     /// Pretty-print all registered diagnostics to standard error.
     ///
     /// Returns `true` if no errors were printed, `false` if any were.
-    pub fn print_all_errors(&self) -> bool {
+    pub fn print_all_errors(&self, min_severity: Severity) -> bool {
         let stderr = io::stderr();
         let stderr = &mut stderr.lock();
         let errors = self.errors();
+        let mut printed = false;
         for err in errors.iter() {
-            self.pretty_print_error(stderr, &err).expect("error writing to stderr");
+            if err.severity <= min_severity {
+                self.pretty_print_error(stderr, &err).expect("error writing to stderr");
+                printed = true;
+            }
         }
-        errors.is_empty()
+        printed
+    }
+
+    /// Print messages and panic if there were any errors.
+    #[inline]
+    #[doc(hidden)]
+    pub fn assert_success(&self) {
+        if self.print_all_errors(Severity::Info) {
+            panic!("there were parse errors");
+        }
     }
 }
 
@@ -242,12 +268,6 @@ impl DMError {
     /// Deconstruct this error, returning only the description.
     pub fn into_description(self) -> String {
         self.desc
-    }
-}
-
-impl From<io::Error> for DMError {
-    fn from(e: io::Error) -> DMError {
-        DMError::new(Location::default(), "i/o error").set_cause(e)
     }
 }
 
