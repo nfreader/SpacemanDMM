@@ -2,6 +2,7 @@
 //!
 //! Most AST types can be pretty-printed using the `Display` trait.
 use std::fmt;
+use std::iter::FromIterator;
 
 use linked_hash_map::LinkedHashMap;
 
@@ -87,6 +88,8 @@ pub enum BinaryOp {
     Greater,
     LessEq,
     GreaterEq,
+    Equiv,
+    NotEquiv,
     BitAnd,
     BitXor,
     BitOr,
@@ -94,6 +97,7 @@ pub enum BinaryOp {
     RShift,
     And,
     Or,
+    In,
 }
 
 impl fmt::Display for BinaryOp {
@@ -112,6 +116,8 @@ impl fmt::Display for BinaryOp {
             Greater => ">",
             LessEq => "<=",
             GreaterEq => ">=",
+            Equiv => "~=",
+            NotEquiv => "~!",
             BitAnd => "&",
             BitXor => "^",
             BitOr => "|",
@@ -119,6 +125,7 @@ impl fmt::Display for BinaryOp {
             RShift => ">>",
             And => "&&",
             Or => "||",
+            In => "in",
         })
     }
 }
@@ -131,6 +138,7 @@ pub enum AssignOp {
     SubAssign,
     MulAssign,
     DivAssign,
+    ModAssign,
     BitAndAssign,
     BitOrAssign,
     BitXorAssign,
@@ -147,6 +155,7 @@ impl fmt::Display for AssignOp {
             SubAssign => "-=",
             MulAssign => "*=",
             DivAssign => "/=",
+            ModAssign => "%=",
             BitAndAssign => "&=",
             BitXorAssign => "^=",
             BitOrAssign => "|=",
@@ -309,8 +318,21 @@ pub enum Term {
     },
     /// A `list` call. Associations are represented by assignment expressions.
     List(Vec<Expression>),
+    /// An `input` call.
+    Input {
+        args: Vec<Expression>,
+        input_type: InputType, // as
+        in_list: Option<Box<Expression>>, // in
+    },
+    /// A `locate` call.
+    Locate {
+        args: Vec<Expression>,
+        in_list: Option<Box<Expression>>, // in
+    },
     /// An unscoped function call.
     Call(String, Vec<Expression>),
+    /// A `..()` call. If arguments is empty, the proc's arguments are passed.
+    ParentCall(Vec<Expression>),
     /// A prefab literal (path + vars).
     Prefab(Prefab),
     /// An identifier.
@@ -330,7 +352,7 @@ pub enum Term {
     /// A use of the `call()()` primitive.
     DynamicCall(Vec<Expression>, Vec<Expression>),
     /// An interpolated string, alternating string/expr/string/expr.
-    InterpString(String, Vec<(Expression, String)>),
+    InterpString(String, Vec<(Option<Expression>, String)>),
 }
 
 impl From<Expression> for Term {
@@ -349,34 +371,207 @@ impl From<Expression> for Term {
     }
 }
 
+/// The possible kinds of index operators, for both fields and methods.
+#[derive(Debug, Copy, Clone, Eq, PartialEq)]
+pub enum IndexKind {
+    /// `a.b`
+    Dot,
+    /// `a:b`
+    Colon,
+    /// `a?.b`
+    SafeDot,
+    /// `a?:b`
+    SafeColon,
+}
+
 /// An expression part which is applied to a term or another follow.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Follow {
-    /// Access a field of the value.
-    Field(String),
     /// Index the value by an expression.
     Index(Box<Expression>),
+    /// Access a field of the value.
+    Field(IndexKind, String),
     /// Call a method of the value.
-    Call(String, Vec<Expression>),
-    /// Cast the value using the "as" operator.
-    Cast(String),
+    Call(IndexKind, String, Vec<Expression>),
 }
 
 /// A parameter declaration in the header of a proc.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Default)]
 pub struct Parameter {
     pub path: Vec<String>,
     pub name: String,
     pub default: Option<Expression>,
-    pub as_types: Option<Vec<String>>,
+    pub input_type: InputType,
     pub in_list: Option<Expression>,
 }
 
+impl fmt::Display for Parameter {
+    fn fmt(&self, fmt: &mut fmt::Formatter) -> fmt::Result {
+        for each in self.path.iter() {
+            write!(fmt, "{}/", each)?;
+        }
+        fmt.write_str(&self.name)?;
+        if !self.input_type.is_empty() {
+            write!(fmt, " as {}", self.input_type)?;
+        }
+        Ok(())
+    }
+}
+
+macro_rules! type_table {
+    ($(#[$attr:meta])* pub struct $name:ident; $($txt:expr, $i:ident, $val:expr;)*) => {
+        bitflags! {
+            $(#[$attr])*
+            /// A type specifier for verb arguments and input() calls.
+            pub struct $name: u32 {
+                $(const $i = $val;)*
+            }
+        }
+
+        impl $name {
+            pub fn from_str(text: &str) -> Option<Self> {
+                match text {
+                    $(
+                        $txt => Some($name::$i),
+                    )*
+                    _ => None,
+                }
+            }
+        }
+
+        impl fmt::Display for $name {
+            fn fmt(&self, fmt: &mut fmt::Formatter) -> fmt::Result {
+                let mut first = true;
+                $(
+                    if self.contains($name::$i) {
+                        write!(fmt, "{}{}", if first { "" } else { "|" }, $txt)?;
+                        first = false;
+                    }
+                )*
+                let _ = first;
+                Ok(())
+            }
+        }
+    }
+}
+
+type_table! {
+    /// A type specifier for verb arguments and input() calls.
+    #[derive(Default)]
+    pub struct InputType;
+
+    // These values can be known with an invocation such as:
+    //     src << as(command_text)
+    "mob",          MOB,          1 << 0;
+    "obj",          OBJ,          1 << 1;
+    "text",         TEXT,         1 << 2;
+    "num",          NUM,          1 << 3;
+    "file",         FILE,         1 << 4;
+    "turf",         TURF,         1 << 5;
+    "key",          KEY,          1 << 6;
+    "null",         NULL,         1 << 7;
+    "area",         AREA,         1 << 8;
+    "icon",         ICON,         1 << 9;
+    "sound",        SOUND,        1 << 10;
+    "message",      MESSAGE,      1 << 11;
+    "anything",     ANYTHING,     1 << 12;
+    "password",     PASSWORD,     1 << 15;
+    "command_text", COMMAND_TEXT, 1 << 16;
+    "color",        COLOR,        1 << 17;
+}
+
+/// A type which may be ascribed to a `var`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct VarType {
+    pub is_static: bool,
+    pub is_const: bool,
+    pub is_tmp: bool,
+    pub type_path: TypePath,
+}
+
+impl VarType {
+    #[inline]
+    pub fn is_const_evaluable(&self) -> bool {
+        self.is_const || (!self.is_static && !self.is_tmp)
+    }
+}
+
+impl FromIterator<String> for VarType {
+    fn from_iter<T: IntoIterator<Item=String>>(iter: T) -> Self {
+        Self::from_iter(iter.into_iter().map(|p| (PathOp::Slash, p)))
+    }
+}
+
+impl FromIterator<(PathOp, String)> for VarType {
+    fn from_iter<T: IntoIterator<Item=(PathOp, String)>>(iter: T) -> Self {
+        let (mut is_static, mut is_const, mut is_tmp) = (false, false, false);
+        let type_path = iter.into_iter()
+            .skip_while(|(_, p)| {
+                if p == "global" || p == "static" {
+                    is_static = true; true
+                } else if p == "const" {
+                    is_const = true; true
+                } else if p == "tmp" {
+                    is_tmp = true; true
+                } else {
+                    false
+                }
+            })
+            .collect();
+        VarType { is_static, is_const, is_tmp, type_path }
+    }
+}
+
+/// A statement in a proc body.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Statement {
     Expr(Expression),
     Return(Option<Expression>),
+    Throw(Expression),
     While(Expression, Vec<Statement>),
     DoWhile(Vec<Statement>, Expression),
     If(Vec<(Expression, Vec<Statement>)>, Option<Vec<Statement>>),
+    ForLoop {
+        init: Option<Box<Statement>>,
+        test: Option<Expression>,
+        inc: Option<Box<Statement>>,
+        block: Vec<Statement>,
+    },
+    ForList {
+        var_type: Option<VarType>,
+        name: String,
+        /// If zero, uses the declared type of the variable.
+        input_type: InputType,
+        /// Defaults to 'world'.
+        in_list: Option<Expression>,
+        block: Vec<Statement>,
+    },
+    ForRange {
+        var_type: Option<VarType>,
+        name: String,
+        start: Expression,
+        end: Expression,
+        step: Option<Expression>,
+        block: Vec<Statement>,
+    },
+    Var {
+        var_type: VarType,
+        name: String,
+        value: Option<Expression>,
+    },
+    Setting(String, SettingMode, Expression),
+    Spawn(Option<Expression>, Vec<Statement>),
+    Switch(Expression, Vec<(Vec<Case>, Vec<Statement>)>, Option<Vec<Statement>>),
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum SettingMode {
+    Assign,
+    In,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum Case {
+    Exact(Expression),
+    Range(Expression, Expression),
 }

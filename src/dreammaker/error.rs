@@ -1,15 +1,18 @@
 //! Error, warning, and other diagnostics handling.
 
 use std::{fmt, error, io};
-use std::path::PathBuf;
+use std::path::{PathBuf, Path};
 use std::cell::{RefCell, Ref};
+use std::collections::HashMap;
 
 /// An identifier referring to a loaded file.
 #[derive(Copy, Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
-pub struct FileId(u32);
+pub struct FileId(u16);
 
-const FILEID_BAD: FileId = FileId(::std::u32::MAX);
-const FILEID_BUILTINS: FileId = FileId(0xfffffffe);
+const FILEID_BUILTINS: FileId = FileId(0x0000);
+const FILEID_MIN: FileId = FileId(0x0001);
+const FILEID_MAX: FileId = FileId(0xfffe);
+const FILEID_BAD: FileId = FileId(0xffff);
 
 impl Default for FileId {
     fn default() -> FileId {
@@ -29,19 +32,34 @@ impl FileId {
 pub struct Context {
     /// The list of loaded files.
     files: RefCell<Vec<PathBuf>>,
+    /// Reverse mapping from paths to file numbers.
+    reverse_files: RefCell<HashMap<PathBuf, FileId>>,
     /// A list of errors, warnings, and other diagnostics generated.
     errors: RefCell<Vec<DMError>>,
-    /// A list of all preprocessor symbols in the project.
-    defines: RefCell<Vec<(String, Location)>>,
+    /// Severity at and above which errors will be printed immediately.
+    print_severity: Option<Severity>,
 }
 
 impl Context {
     /// Add a new file to the context and return its index.
     pub fn register_file(&self, path: PathBuf) -> FileId {
+        if let Some(id) = self.reverse_files.borrow().get(&path).cloned() {
+            return id;
+        }
         let mut files = self.files.borrow_mut();
-        let len = files.len() as u32;
-        files.push(path);
-        FileId(len)
+        if files.len() > FILEID_MAX.0 as usize {
+            panic!("file limit of {} exceeded", FILEID_MAX.0);
+        }
+        let len = files.len() as u16;
+        files.push(path.clone());
+        let id = FileId(len + FILEID_MIN.0);
+        self.reverse_files.borrow_mut().insert(path, id);
+        id
+    }
+
+    /// Look up a file's ID by its path, without inserting it.
+    pub fn get_file(&self, path: &Path) -> Option<FileId> {
+        self.reverse_files.borrow().get(path).cloned()
     }
 
     /// Look up a file path by its index returned from `register_file`.
@@ -49,8 +67,8 @@ impl Context {
         if file == FILEID_BUILTINS {
             return "(builtins)".into();
         }
+        let idx = (file.0 - FILEID_MIN.0) as usize;
         let files = self.files.borrow();
-        let idx = file.0 as usize;
         if idx > files.len() {
             "(unknown)".into()
         } else {
@@ -60,6 +78,12 @@ impl Context {
 
     /// Push an error or other diagnostic to the context.
     pub fn register_error(&self, error: DMError) {
+        if let Some(severity) = self.print_severity {
+            if error.severity <= severity {
+                let stderr = io::stderr();
+                self.pretty_print_error(&mut stderr.lock(), &error).expect("error writing to stderr");
+            }
+        }
         self.errors.borrow_mut().push(error);
     }
 
@@ -68,14 +92,9 @@ impl Context {
         Ref::map(self.errors.borrow(), |x| &**x)
     }
 
-    /// Push a preprocessor symbol to the symbol list.
-    pub fn register_define(&self, name: String, location: Location) {
-        self.defines.borrow_mut().push((name, location));
-    }
-
-    /// Access the list of preprocessor symbols.
-    pub fn defines(&self) -> Ref<[(String, Location)]> {
-        Ref::map(self.defines.borrow(), |x| &**x)
+    /// Set a severity at and above which errors will be printed immediately.
+    pub fn set_print_severity(&mut self, print_severity: Option<Severity>) {
+        self.print_severity = print_severity;
     }
 
     /// Pretty-print a `DMError` to the given output.
@@ -84,20 +103,33 @@ impl Context {
             self.file_path(error.location.file).display(),
             error.location.line,
             error.location.column)?;
-        writeln!(w, "{}\n", error.desc)
+        writeln!(w, "{}: {}\n", error.severity, error.desc)
     }
 
     /// Pretty-print all registered diagnostics to standard error.
     ///
     /// Returns `true` if no errors were printed, `false` if any were.
-    pub fn print_all_errors(&self) -> bool {
+    pub fn print_all_errors(&self, min_severity: Severity) -> bool {
         let stderr = io::stderr();
         let stderr = &mut stderr.lock();
         let errors = self.errors();
+        let mut printed = false;
         for err in errors.iter() {
-            self.pretty_print_error(stderr, &err).expect("error writing to stderr");
+            if err.severity <= min_severity {
+                self.pretty_print_error(stderr, &err).expect("error writing to stderr");
+                printed = true;
+            }
         }
-        errors.is_empty()
+        printed
+    }
+
+    /// Print messages and panic if there were any errors.
+    #[inline]
+    #[doc(hidden)]
+    pub fn assert_success(&self) {
+        if self.print_all_errors(Severity::Info) {
+            panic!("there were parse errors");
+        }
     }
 }
 
@@ -112,7 +144,31 @@ pub struct Location {
     /// The line number, starting at 1.
     pub line: u32,
     /// The column number, starting at 1.
-    pub column: u32,
+    pub column: u16,
+}
+
+impl Location {
+    /// Pack this Location for use in `u64`-keyed structures.
+    pub fn pack(self) -> u64 {
+        ((self.file.0 as u64) << 48) | ((self.line as u64) << 16) | (self.column as u64)
+    }
+
+    /// Return the predecessor of this `Location`.
+    pub fn pred(mut self) -> Location {
+        if self.column != 0 {
+            self.column -= 1;
+        } else if self.line != 0 {
+            self.column = !0;
+            self.line -= 1;
+        } else if self.file.0 != 0 {
+            self.column = !0;
+            self.line = !0;
+            self.file.0 -= 1;
+        } else {
+            panic!("cannot take pred() of lowest possible Location")
+        }
+        self
+    }
 }
 
 /// A trait for types which may yield location information.
@@ -150,6 +206,17 @@ pub enum Severity {
 impl Default for Severity {
     fn default() -> Severity {
         Severity::Error
+    }
+}
+
+impl fmt::Display for Severity {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        match *self {
+            Severity::Error => f.write_str("error"),
+            Severity::Warning => f.write_str("warning"),
+            Severity::Info => f.write_str("info"),
+            Severity::Hint => f.write_str("hint"),
+        }
     }
 }
 
@@ -201,12 +268,6 @@ impl DMError {
     /// Deconstruct this error, returning only the description.
     pub fn into_description(self) -> String {
         self.desc
-    }
-}
-
-impl From<io::Error> for DMError {
-    fn from(e: io::Error) -> DMError {
-        DMError::new(Location::default(), "i/o error").set_cause(e)
     }
 }
 

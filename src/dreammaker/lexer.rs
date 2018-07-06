@@ -2,8 +2,9 @@
 use std::io;
 use std::str::FromStr;
 use std::fmt;
+use std::borrow::Cow;
 
-use super::{DMError, Location, HasLocation, FileId, Context};
+use super::{DMError, Location, HasLocation, FileId, Context, Severity};
 
 macro_rules! table {
     ($(#[$attr:meta])* table $tabname:ident: $repr:ty => $enum_:ident; $($literal:expr, $name:ident;)*) => {
@@ -45,6 +46,7 @@ table! {
     b"#",   Hash;
     b"##",  TokenPaste;
     b"%",	Mod;
+    b"%=",  ModAssign;
     b"&",	BitAnd;
     b"&&",	And;
     b"&=",	BitAndAssign;
@@ -82,6 +84,8 @@ table! {
     b">>",	RShift;
     b">>=",	RShiftAssign;
     b"?",   QuestionMark;
+    b"?.",  SafeDot;
+    b"?:",  SafeColon;
     b"[",	LBracket;
     b"]",	RBracket;
     b"^",	BitXor;
@@ -93,6 +97,16 @@ table! {
     b"||",	Or;
     b"}",	RBrace;
     b"~",	BitNot;
+    b"~!",  NotEquiv;
+    b"~=",  Equiv;
+    // Keywords - not checked by read_punct
+    b"in",  In;
+}
+
+impl fmt::Display for Punctuation {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        f.write_str(::std::str::from_utf8(self.value()).unwrap())
+    }
 }
 
 /// A single DM token.
@@ -179,6 +193,17 @@ impl Token {
             _ => false,
         }
     }
+
+    /// Check whether this token is whitespace.
+    pub fn is_whitespace(&self) -> bool {
+        match *self {
+            Token::Punct(Punctuation::Tab) |
+            Token::Punct(Punctuation::Newline) |
+            Token::Punct(Punctuation::Space) |
+            Token::Eof => true,
+            _ => false
+        }
+    }
 }
 
 impl fmt::Display for Token {
@@ -186,7 +211,7 @@ impl fmt::Display for Token {
         use self::Token::*;
         match *self {
             Eof => f.write_str("__EOF__"),
-            Punct(p) => f.write_str(::std::str::from_utf8(p.value()).unwrap()),
+            Punct(p) => write!(f, "{}", p),
             Ident(ref i, _) => f.write_str(i),
             String(ref i) => write!(f, "\"{}\"", i),
             InterpStringBegin(ref i) => write!(f, "\"{}[", i),
@@ -221,12 +246,38 @@ fn is_ident(ch: u8) -> bool {
     (ch >= b'a' && ch <= b'z') || (ch >= b'A' && ch <= b'Z') || ch == b'_'
 }
 
-fn from_latin1(bytes: &[u8]) -> String {
-    let mut output = String::new();
-    for &byte in bytes {
+/// Convert the input bytes to a `String` assuming Latin-1 encoding.
+pub fn from_latin1(mut bytes: Vec<u8>) -> String {
+    let non_ascii = bytes.iter().filter(|&&i| i > 0x7f).count();
+    if non_ascii == 0 {
+        match String::from_utf8(bytes) {
+            Ok(v) => return v,
+            // shouldn't happen, but try to produce a sensible result anyways
+            Err(e) => bytes = e.into_bytes(),
+        }
+    }
+
+    let mut output = String::with_capacity(bytes.len() + non_ascii);
+    for &byte in bytes.iter() {
         output.push(byte as char);
     }
     output
+}
+
+/// Convert the input bytes to a `String` assuming Latin-1 encoding.
+pub fn from_latin1_borrowed(bytes: &[u8]) -> Cow<str> {
+    let non_ascii = bytes.iter().filter(|&&i| i > 0x7f).count();
+    if non_ascii == 0 {
+        if let Ok(v) = ::std::str::from_utf8(bytes) {
+            return Cow::Borrowed(v);
+        }
+    }
+
+    let mut output = String::with_capacity(bytes.len() + non_ascii);
+    for &byte in bytes.iter() {
+        output.push(byte as char);
+    }
+    Cow::Owned(output)
 }
 
 // Used to track nested string interpolations and know when they end.
@@ -245,23 +296,110 @@ enum Directive {
     Stringy,
 }
 
-/// The lexer, which serves as a source of tokens through iteration.
-#[derive(Debug)]
-pub struct Lexer<'ctx, I> {
-    context: &'ctx Context,
-    input: I,
-    next: Option<u8>,
+/// A wrapper for an input stream which tracks line and column numbers.
+///
+/// All characters, including tabs, are considered to occupy one column
+/// regardless of position.
+///
+/// `io::Error`s are converted to `DMError`s which include the location.
+pub struct LocationTracker<I> {
+    inner: I,
     /// The location of the last character returned by `next()`.
     location: Location,
-    at_line_head: bool,
     at_line_end: bool,
+}
+
+impl<I> LocationTracker<I> {
+    pub fn new(file_number: FileId, inner: I) -> LocationTracker<I> {
+        LocationTracker {
+            inner,
+            location: Location {
+                file: file_number,
+                line: 0,
+                column: 0,
+            },
+            at_line_end: true,
+        }
+    }
+}
+
+impl<I> fmt::Debug for LocationTracker<I> {
+    fn fmt(&self, fmt: &mut fmt::Formatter) -> fmt::Result {
+        fmt.debug_struct("LocationTracker")
+            // inner omitted
+            .field("location", &self.location)
+            .field("at_line_end", &self.at_line_end)
+            .finish()
+    }
+}
+
+impl<I> HasLocation for LocationTracker<I> {
+    fn location(&self) -> Location {
+        self.location
+    }
+}
+
+impl<I: Iterator<Item=io::Result<u8>>> Iterator for LocationTracker<I> {
+    type Item = Result<u8, DMError>;
+
+    fn next(&mut self) -> Option<Result<u8, DMError>> {
+        if self.at_line_end {
+            self.at_line_end = false;
+            match self.location.line.checked_add(1) {
+                Some(new) => self.location.line = new,
+                None => panic!("per-file line limit of {} exceeded", self.location.line),
+            }
+            self.location.column = 0;
+        }
+
+        match self.inner.next() {
+            None => None,
+            Some(Ok(ch)) => {
+                if ch == b'\n' {
+                    self.at_line_end = true;
+                }
+                match self.location.column.checked_add(1) {
+                    Some(new) => self.location.column = new,
+                    None => panic!("per-line column limit of {} exceeded", self.location.column),
+                }
+                Some(Ok(ch))
+            }
+            Some(Err(e)) => {
+                Some(Err(DMError::new(self.location, "i/o error").set_cause(e)))
+            }
+        }
+    }
+}
+
+/// The lexer, which serves as a source of tokens through iteration.
+pub struct Lexer<'ctx, I> {
+    context: &'ctx Context,
+    input: LocationTracker<I>,
+    next: Option<u8>,
+    final_newline: bool,
+    at_line_head: bool,
     directive: Directive,
     interp_stack: Vec<Interpolation>,
 }
 
+impl<'ctx, I> fmt::Debug for Lexer<'ctx, I> {
+    fn fmt(&self, fmt: &mut fmt::Formatter) -> fmt::Result {
+        fmt.debug_struct("Lexer")
+            .field("context", self.context)
+            .field("input", &self.input)
+            .field("next", &self.next)
+            .field("final_newline", &self.final_newline)
+            .field("at_line_head", &self.at_line_head)
+            .field("directive", &self.directive)
+            .field("interp_stack", &self.interp_stack)
+            .finish()
+    }
+}
+
 impl<'ctx, I: Iterator<Item=io::Result<u8>>> HasLocation for Lexer<'ctx, I> {
+    #[inline]
     fn location(&self) -> Location {
-        self.location
+        self.input.location
     }
 }
 
@@ -277,15 +415,10 @@ impl<'ctx, I: Iterator<Item=io::Result<u8>>> Lexer<'ctx, I> {
     pub fn new(context: &'ctx Context, file_number: FileId, input: I) -> Lexer<I> {
         Lexer {
             context,
-            input,
+            input: LocationTracker::new(file_number, input),
             next: None,
-            location: Location {
-                file: file_number,
-                line: 1,
-                column: 0,
-            },
+            final_newline: false,
             at_line_head: true,
-            at_line_end: false,
             directive: Directive::None,
             interp_stack: Vec::new(),
         }
@@ -296,30 +429,25 @@ impl<'ctx, I: Iterator<Item=io::Result<u8>>> Lexer<'ctx, I> {
             return Some(next);
         }
 
-        if self.at_line_end {
-            self.at_line_end = false;
+        let previous_loc = self.location();
+        let result = self.input.next();
+        if self.location().line > previous_loc.line {
             self.at_line_head = true;
-            self.location.line += 1;
-            self.location.column = 0;
             self.directive = Directive::None;
         }
-
-        match self.input.next() {
+        match result {
+            None => None,
             Some(Ok(ch)) => {
-                if ch == b'\n' {
-                    self.at_line_end = true;
-                } else if ch != b'\t' && ch != b' ' && self.at_line_head {
+                if ch != b'\t' && ch != b' ' {
                     self.at_line_head = false;
                 }
-                self.location.column += 1;
                 Some(ch)
             }
             Some(Err(err)) => {
                 // I/O error is effectively EOF.
-                self.context.register_error(self.error("i/o error").set_cause(err));
+                self.context.register_error(err);
                 None
             }
-            None => None,
         }
     }
 
@@ -409,7 +537,10 @@ impl<'ctx, I: Iterator<Item=io::Result<u8>>> Lexer<'ctx, I> {
                     // Got "1.#INF", change it to "inf" for read_number.
                     return (false, 10, "inf".to_owned());
                 }
-                Some(ch) if (ch as char).is_digit(::std::cmp::max(radix, 10)) => buf.push(ch as char),
+                Some(ch) if (ch as char).is_digit(::std::cmp::max(radix, 10)) => {
+                    exponent = false;
+                    buf.push(ch as char);
+                }
                 ch => {
                     self.put_back(ch);
                     return (integer, radix, buf);
@@ -421,14 +552,27 @@ impl<'ctx, I: Iterator<Item=io::Result<u8>>> Lexer<'ctx, I> {
     fn read_number(&mut self, first: u8) -> Token {
         let (integer, radix, buf) = self.read_number_inner(first);
         if integer {
-            match i32::from_str_radix(&buf, radix) {
-                Ok(val) => Token::Int(val),
-                Err(e) => {
-                    self.context.register_error(self.error(
-                        format!("bad base-{} integer \"{}\": {}", radix, buf, e)));
-                    Token::Int(0)  // fallback
+            let original_error = match i32::from_str_radix(&buf, radix) {
+                Ok(val) => return Token::Int(val),
+                Err(e) => e,
+            };
+            // Try to parse it as a float instead - this will catch numbers
+            // that are formatted like integers but are out of the range of our
+            // integer type.
+            if radix == 10 {
+                if let Ok(val) = f32::from_str(&buf) {
+                    let val_str = val.to_string();
+                    if val_str != buf {
+                        self.context.register_error(self.error(
+                            format!("precision loss of integer constant: \"{}\" to {}", buf, val)
+                        ).set_severity(Severity::Warning));
+                    }
+                    return Token::Float(val)
                 }
             }
+            self.context.register_error(self.error(
+                format!("bad base-{} integer \"{}\": {}", radix, buf, original_error)));
+            Token::Int(0)  // fallback
         } else {
             // ignore radix
             match f32::from_str(&buf) {
@@ -450,7 +594,7 @@ impl<'ctx, I: Iterator<Item=io::Result<u8>>> Lexer<'ctx, I> {
                 ch => { self.put_back(ch); break }
             }
         }
-        from_latin1(&ident)
+        from_latin1(ident)
     }
 
     fn read_resource(&mut self) -> String {
@@ -466,7 +610,7 @@ impl<'ctx, I: Iterator<Item=io::Result<u8>>> Lexer<'ctx, I> {
                 }
             }
         }
-        from_latin1(&buf)
+        from_latin1(buf)
     }
 
     fn read_string(&mut self, end: &'static [u8], interp_closed: bool) -> Token {
@@ -528,7 +672,7 @@ impl<'ctx, I: Iterator<Item=io::Result<u8>>> Lexer<'ctx, I> {
             }
         }
 
-        let string = from_latin1(&buf);
+        let string = from_latin1(buf);
         match (interp_opened, interp_closed) {
             (true, true) => Token::InterpStringPart(string),
             (true, false) => Token::InterpStringBegin(string),
@@ -541,7 +685,7 @@ impl<'ctx, I: Iterator<Item=io::Result<u8>>> Lexer<'ctx, I> {
         // requires that PUNCT_TABLE be ordered, shorter entries be first,
         // and all entries with >1 character also have their prefix in the table
         let mut items: Vec<_> = PUNCT_TABLE.iter()
-            .skip_while(|&&(tok, _)| tok[0] != first)
+            .skip_while(|&&(tok, _)| tok[0] < first)
             .take_while(|&&(tok, _)| tok[0] == first)
             .collect();
         if items.is_empty() {
@@ -594,11 +738,12 @@ impl<'ctx, I: Iterator<Item=io::Result<u8>>> Iterator for Lexer<'ctx, I> {
                 Some(t) => t,
                 None => {
                     // always end with a newline
-                    if !self.at_line_head {
-                        self.at_line_head = true;
-                        self.location.column += 1;
+                    if !self.final_newline {
+                        self.final_newline = true;
+                        let mut location = self.location();
+                        location.column += 1;
                         return Some(LocatedToken {
-                            location: self.location(),
+                            location: location,
                             token: Token::Punct(Punctuation::Newline),
                         })
                     } else {
@@ -608,7 +753,7 @@ impl<'ctx, I: Iterator<Item=io::Result<u8>>> Iterator for Lexer<'ctx, I> {
             };
             skip_newlines = false;
 
-            let loc = self.location;
+            let loc = self.location();
             let locate = |token| LocatedToken::new(loc, token);
 
             if self.directive == Directive::Stringy {
@@ -665,6 +810,12 @@ impl<'ctx, I: Iterator<Item=io::Result<u8>>> Iterator for Lexer<'ctx, I> {
                                 self.directive = Directive::Ordinary;
                             }
                         }
+                        // check keywords
+                        for &(name, value) in PUNCT_TABLE.iter() {
+                            if name == ident.as_bytes() {
+                                return Some(locate(Punct(value)))
+                            }
+                        }
                         Some(locate(Ident(ident, ws)))
                     }
                     b'\\' => {
@@ -672,6 +823,7 @@ impl<'ctx, I: Iterator<Item=io::Result<u8>>> Iterator for Lexer<'ctx, I> {
                         skip_newlines = true;
                         continue;
                     }
+                    b'@' => continue,  // TODO: parse these rather than ignoring them
                     _ => {
                         if !found_illegal {
                             self.context.register_error(self.error(format!("illegal byte 0x{:x}", first)));
