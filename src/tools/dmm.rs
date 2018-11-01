@@ -21,7 +21,7 @@ type KeyType = u16;
 #[derive(Copy, Clone, Debug, Hash, Ord, Eq, PartialOrd, PartialEq, Default)]
 pub struct Key(u16);
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Map {
     pub key_length: u8,
     // sorted order
@@ -32,7 +32,7 @@ pub struct Map {
 pub type Grid<'a> = ndarray::ArrayBase<ndarray::ViewRepr<&'a Key>, ndarray::Dim<[usize; 2]>>;
 
 // TODO: port to ast::Prefab<Constant>
-#[derive(Debug, Default, PartialEq)]
+#[derive(Debug, Default, Hash, Eq, PartialEq, Clone)]
 pub struct Prefab {
     pub path: String,
     // insertion order, sort of most of the time alphabetical but not quite
@@ -41,7 +41,6 @@ pub struct Prefab {
 
 impl Map {
     pub fn from_file(path: &Path) -> Result<Map, DMError> {
-        flame!("Map::from_file");
         let mut map = Map {
             key_length: 0,
             dictionary: Default::default(),
@@ -53,9 +52,37 @@ impl Map {
         Ok(map)
     }
 
+    pub fn new(x: usize, y: usize, z: usize, turf: String, area: String) -> Map {
+        assert!(x > 0 && y > 0 && z > 0, "({}, {}, {})", x, y, z);
+
+        let mut dictionary = BTreeMap::new();
+        dictionary.insert(Key(0), vec![
+            Prefab::from_path(turf),
+            Prefab::from_path(area),
+        ]);
+
+        let grid = Array3::default((z, y, x));  // default = 0
+
+        Map {
+            key_length: 1,
+            dictionary,
+            grid,
+        }
+    }
+
     pub fn to_file(&self, path: &Path) -> io::Result<()> {
         // DMM saver later
         save_tgm(self, File::create(path)?)
+    }
+
+    pub fn adjust_key_length(&mut self) {
+        if self.dictionary.len() > 2704 {
+            self.key_length = 3;
+        } else if self.dictionary.len() > 52 {
+            self.key_length = 2;
+        } else {
+            self.key_length = 1;
+        }
     }
 
     #[inline]
@@ -85,6 +112,50 @@ impl Map {
 
     pub fn one_to_zero(&self, (x, y, z): (usize, usize, usize)) -> (usize, usize, usize) {
         (x - 1, self.grid.dim().1 - y, z - 1)
+    }
+}
+
+impl Prefab {
+    pub fn from_path<S: Into<String>>(path: S) -> Prefab {
+        Prefab {
+            path: path.into(),
+            vars: Default::default(),
+        }
+    }
+}
+
+impl fmt::Display for Prefab {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        f.write_str(&self.path)?;
+        if !self.vars.is_empty() {
+            write!(f, " {{")?;
+            let mut first = true;
+            for (k, v) in self.vars.iter() {
+                if !first {
+                    write!(f, "; ")?;
+                }
+                first = false;
+                if f.alternate() {
+                    f.write_str("\n    ")?;
+                }
+                write!(f, "{} = {}", k, v)?;
+            }
+            if f.alternate() {
+                f.write_str("\n")?;
+            }
+            write!(f, "}}")?;
+        }
+        Ok(())
+    }
+}
+
+impl Key {
+    pub fn invalid() -> Key {
+        Key(KeyType::max_value())
+    }
+
+    pub fn next(self) -> Key {
+        Key(self.0 + 1)
     }
 }
 
@@ -205,11 +276,11 @@ fn parse_map(map: &mut Map, f: File) -> Result<(), DMError> {
         if ch == b'\n' || ch == b'\r' {
             in_comment_line = false;
             comment_trigger = false;
-            continue
+            continue;
         } else if in_comment_line {
-            continue
+            continue;
         } else if ch == b'\t' {
-            continue
+            continue;
         }
 
         if ch == b'/' && !in_quote_block {
@@ -251,19 +322,23 @@ fn parse_map(map: &mut Map, f: File) -> Result<(), DMError> {
                     } else if ch == b'=' && curr_var.is_empty() {
                         curr_var = take(&mut curr_datum);
                         let mut length = curr_var.len();
-                        while length > 0 && (curr_var[length-1] as char).is_whitespace() {
+                        while length > 0 && (curr_var[length - 1] as char).is_whitespace() {
                             length -= 1;
                         }
                         curr_var.truncate(length);
                         skip_whitespace = true;
                     } else if ch == b';' {
-                        curr_prefab.vars.insert(from_latin1(take(&mut curr_var)),
-                            parse_constant(chars.location(), take(&mut curr_datum))?);
+                        curr_prefab.vars.insert(
+                            from_latin1(take(&mut curr_var)),
+                            parse_constant(chars.location(), take(&mut curr_datum))?,
+                        );
                         skip_whitespace = true;
                     } else if ch == b'}' {
                         if !curr_var.is_empty() {
-                            curr_prefab.vars.insert(from_latin1(take(&mut curr_var)),
-                                parse_constant(chars.location(), take(&mut curr_datum))?);
+                            curr_prefab.vars.insert(
+                                from_latin1(take(&mut curr_var)),
+                                parse_constant(chars.location(), take(&mut curr_datum))?,
+                            );
                         }
                         in_varedit_block = false;
                     } else {
@@ -319,7 +394,9 @@ fn parse_map(map: &mut Map, f: File) -> Result<(), DMError> {
     // grid
     #[derive(PartialEq, Debug)]
     enum Coord {
-        X, Y, Z
+        X,
+        Y,
+        Z,
     }
 
     let mut grid = BTreeMap::new();
@@ -358,7 +435,7 @@ fn parse_map(map: &mut Map, f: File) -> Result<(), DMError> {
             } else {
                 match (ch as char).to_digit(10) {
                     Some(x) => curr_num = 10 * curr_num + x as usize,
-                    None => return Err(DMError::new(Location::default(), "bad digit in map coordinate"))
+                    None => return Err(DMError::new(Location::default(), "bad digit in map coordinate")),
                 }
             }
         } else if in_map_string {

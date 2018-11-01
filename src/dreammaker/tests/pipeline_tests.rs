@@ -31,7 +31,11 @@ fn check_indentor() {
     let context = Context::default();
     with_test_dme(&context, |mut preprocessor| {
         let mut string = Vec::new();
-        pretty_print(&mut string, indents::IndentProcessor::new(&context, &mut preprocessor).map(|t| t.token), true).unwrap();
+        pretty_print(
+            &mut string,
+            indents::IndentProcessor::new(&context, &mut preprocessor).map(|t| t.token),
+            true,
+        ).unwrap();
         context.assert_success();
     });
 }
@@ -44,12 +48,5 @@ fn check_parser() {
         context.assert_success();
 
         println!("\n--------\nSuccess!\n--------");
-        #[cfg(feature="xml")] {
-            println!("Outputting objtree.xml");
-            _tree.to_xml("objtree.xml".as_ref()).unwrap();
-        }
-        #[cfg(not(feature="xml"))] {
-            println!("Enable --feature xml to output objtree.xml");
-        }
     });
 }

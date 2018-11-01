@@ -18,8 +18,8 @@ pub fn default_defines(defines: &mut DefineMap) {
         ($($i:ident = $($x:expr),*;)*) => {
             $(
                 assert!(defines.insert(
-                    stringify!($i).into(), (location, Define::Constant { subst: vec![$($x),*] })
-                ).is_none());
+                    stringify!($i).into(), (location, Define::Constant { subst: vec![$($x),*], docs: Default::default() })
+                ).is_none(), stringify!($i));
             )*
         }
     }
@@ -121,12 +121,12 @@ pub fn register_builtins(tree: &mut ObjectTree) -> Result<(), DMError> {
     };
 
     macro_rules! entries {
-        ($($($elem:ident)/ * $(($($arg:ident),*))* $(= $val:expr)*;)*) => {
+        ($($($elem:ident)/ * $(($($arg:ident $(= $ignored:expr)*),*))* $(= $val:expr)*;)*) => {
             $(loop {
                 #![allow(unreachable_code)]
                 let elems = [$(stringify!($elem)),*];
                 $(
-                    tree.add_var(location, elems.iter().cloned(), elems.len() + 1, $val)?;
+                    tree.add_var(location, elems.iter().cloned(), elems.len() + 1, $val, Default::default())?;
                     break;
                 )*
                 $(
@@ -135,7 +135,7 @@ pub fn register_builtins(tree: &mut ObjectTree) -> Result<(), DMError> {
                     ),*])?;
                     break;
                 )*
-                tree.add_entry(location, elems.iter().cloned(), elems.len() + 1)?;
+                tree.add_entry(location, elems.iter().cloned(), elems.len() + 1, Default::default())?;
                 break;
             })*
         }
@@ -150,10 +150,14 @@ pub fn register_builtins(tree: &mut ObjectTree) -> Result<(), DMError> {
         }
     }
     macro_rules! int {
-        ($e:expr) => {Expression::from(Term::Int($e))}
+        ($e:expr) => {
+            Expression::from(Term::Int($e))
+        };
     }
     macro_rules! string {
-        ($e:expr) => {Expression::from(Term::String($e.into()))}
+        ($e:expr) => {
+            Expression::from(Term::String($e.into()))
+        };
     }
 
     entries! {
@@ -241,13 +245,168 @@ pub fn register_builtins(tree: &mut ObjectTree) -> Result<(), DMError> {
         var/const/BLEND_SUBTRACT = int!(3);
         var/const/BLEND_MULTIPLY = int!(4);
 
-        // __root
-        var/type;
-        var/parent_type;
-        var/tag;
-        var/vars;
+        // global procs
+        proc/abs(A);
+        proc/addtext(Arg1, Arg2/*, ...*/);
+        proc/alert(Usr/*=usr*/,Message,Title,Button1/*="Ok"*/,Button2,Button3);
+        proc/animate(Object, vars, time, loop, easing, flags);  // +2 forms
+        proc/arccos(X);
+        proc/arcsin(X);
+        proc/arglist(List);  // special form
+        proc/ascii2text(N);
+        proc/block(Start,End);
+        proc/bounds(Ref/*=src*/, Dist/*=0*/);  // +2 forms
+        proc/bounds_dist(Ref, Target);
+        proc/browse(Body,Options);
+        proc/browse_rsc(File,FileName);
+        proc/ckey(Key);
+        proc/ckeyEx(Text);
+        proc/cmptext(T1,T2/*,...*/);
+        proc/cmptextEx(T1,T2/*,...*/);
+        proc/copytext(T,Start/*=1*/,End/*=0*/);
+        proc/cos(X);
+        proc/fcopy(Src,Dst);
+        proc/fcopy_rsc(File);
+        proc/fdel(File);
+        proc/fexists(File);
+        proc/file(Path);
+        proc/file2text(File);
+        proc/filter(type, parameters/*, ...*/);
+        proc/findlasttext(Haystack,Needle,Start=0,End=1);
+        proc/findlasttextEx(Haystack,Needle,Start=0,End=1);
+        proc/findtext(Haystack,Needle,Start=1,End=0);
+        proc/findtextEx(Haystack,Needle,Start=1,End=0);
+        proc/flick(Icon,Object);
+        proc/flist(Path);
+        proc/ftp(File,Name);
+        proc/get_dir(Loc1,Loc2);
+        proc/get_dist(Loc1,Loc2);
+        proc/get_step(Ref,Dir);
+        proc/get_step_away(Ref,Trg,Max=5);
+        proc/get_step_rand(Ref);
+        proc/get_step_to(Ref,Trg,Min=0);
+        proc/get_step_towards(Ref,Trg);
+        proc/hascall(Object,ProcName);
+        proc/hearers(Depth=world.view,Center=usr);
+        proc/html_decode(HtmlText);
+        proc/html_encode(PlainText);
+        proc/icon(icon,state,dir,frame,moving);  // SNA
+        proc/icon_states(Icon, mode=0);
+        proc/image(icon,loc,icon_state,layer,dir);  // SNA
+        proc/initial(Var);  // special form
+        proc/input(Usr=usr,Message,Title,Default)/*as Type in List*/;  // special form
+        proc/isarea(Loc1, Loc2/*,...*/);
+        proc/isfile(File);
+        proc/isicon(Icon);
+        proc/isloc(Loc1, Loc2/*,...*/);
+        proc/ismob(Loc1, Loc2/*,...*/);
+        proc/isnull(Val);
+        proc/isnum(Val);
+        proc/isobj(Loc1, Loc2/*,...*/);
+        proc/ispath(Val,Type); // +1 form
+        proc/issaved(Var);  // special form? FALSE for global, const, tmp
+        proc/istext(Val);
+        proc/isturf(Loc1, Loc2/*,...*/);
+        proc/istype(Val,Type);
+        proc/jointext(List,Glue,Start=1,End=0);
+        proc/json_decode(JSON);
+        proc/json_encode(Value);
+        proc/length(E);
+        proc/link(url);
+        proc/list(A,B,C/*,...*/);  // +1 form
+        proc/list2params(List);
+        proc/locate(Type)/*in Container*/;  // +3 forms
+        proc/log(X=2.718, Y);
+        proc/lowertext(T);
+        proc/matrix();  // +2 forms
+        proc/max(A,B,C/*,...*/);
+        proc/md5(T);
+        proc/min(A,B,C/*,...*/);
+        proc/missile(Type,Start,End);
+        proc/new/*Type*/(Args);  // special form
+        proc/newlist(A,B,C/*,...*/);
+        proc/nonspantext(Haystack,Needles,Start=1);
+        proc/num2text(N,SigFig=6);
+        proc/obounds(Ref=src, Dist=0);  // +1 form
+        proc/ohearers(Depth=world.view,Center=usr);
+        proc/orange(Dist,Center=usr);
+        proc/output(msg, control);
+        proc/oview(Dist,Center=usr);
+        proc/oviewers(Depth=world.view,Center=usr);
+        proc/params2list(Params);
+        proc/pick(Val1,Val2/*,...*/);  // also has a special form
+        proc/prob(P);
+        proc/rand(L=0,H);  // +1 form
+        proc/rand_seed(Seed);
+        proc/range(Dist,Center=usr);
+        proc/regex(pattern, flags);  // +1 form
+        proc/REGEX_QUOTE(text);
+        proc/REGEX_QUOTE_REPLACEMENT(text);
+        proc/replacetext(Haystack,Needle,Replacement,Start=1,End=0);
+        proc/replacetextEx(Haystack,Needle,Replacement,Start=1,End=0);
+        proc/rgb(R,G,B,A=null);
+        proc/roll(ndice=1,sides);  // +1 form
+        proc/round(A,B=null);
+        proc/run(File);
+        proc/shell(Command);
+        proc/shutdown(Addr,Natural=0);
+        proc/sin(X);
+        proc/sleep(Delay);
+        proc/sorttext(T1,T2/*,...*/);
+        proc/sorttextEx(T1,T2/*,...*/);
+        proc/sound(file,repeat=0,wait,channel,volume);  // SNA
+        proc/spantext(Haystack,Needles,Start=1);
+        proc/splittext(Text,Delimiter,Start=1,End=0,include_delimiters=0);
+        proc/sqrt(A);
+        proc/startup(File,Port=0,Options/*,...*/);
+        proc/stat(Name,Value);
+        proc/statpanel(Panel,Name,Value);
+        proc/step(Ref,Dir,Speed=0);
+        proc/step_away(Ref,Trg,Max=5,Speed=0);
+        proc/step_rand(Ref,Speed=0);
+        proc/step_to(Ref,Trg,Min=0,Speed=0);
+        proc/step_towards(Ref,Trg,Speed);
+        proc/text(FormatText,Args);
+        proc/text2ascii(T,pos=1);
+        proc/text2file(Text,File);
+        proc/text2num(T);
+        proc/text2path(T);
+        proc/time2text(timestamp,format);
+        proc/turn(Dir,Angle);  // +2 forms
+        proc/typesof(Type1,Type2/*,...*/);
+        proc/uppertext(T);
+        proc/url_decode(UrlText);
+        proc/url_encode(PlainText, format=0);
+        proc/view(Dist=5,Center=usr);
+        proc/viewers(Depth=world.view,Center=usr);
+        proc/walk(Ref,Dir,Lag=0,Speed=0);
+        proc/walk_away(Ref,Trg,Max=5,Lag=0,Speed=0);
+        proc/walk_rand(Ref,Lag=0,Speed=0);
+        proc/walk_to(Ref,Trg,Min=0,Lag=0,Speed=0);
+        proc/walk_towards(Ref,Trg,Lag=0,Speed=0);
+        proc/winclone(player, window_name, clone_name);
+        proc/winexists(player, control_id);
+        proc/winget(player, control_id, params);
+        proc/winset(player, control_id, params);
+        proc/winshow(player, window, show=1);
 
+        list;
+        list/proc/Add(Item1, Item2/*,...*/);
+        list/proc/Copy(Start=1, End=0);
+        list/proc/Cut(Start=1, End=0);
+        list/proc/Find(Elem, Start=1, End=0);
+        list/proc/Insert(Index, Item1, Item2/*,...*/);
+        list/proc/Join(Glue, Start=1, End=0);
+        list/proc/Remove(Item1, Item2/*,...*/);
+        list/proc/Swap(Index1, Index2);
+        list/var/len;
+
+        // all types pseudo-inherit vars and procs from /datum
         datum;
+        datum/var/const/type;  // not editable
+        datum/var/const/parent_type;  // not editable
+        datum/var/tag;
+        datum/var/const/vars;  // not editable
         datum/proc/New();
         datum/proc/Del();
         datum/proc/Read(/*savefile*/F);
@@ -256,11 +415,11 @@ pub fn register_builtins(tree: &mut ObjectTree) -> Result<(), DMError> {
 
         atom/parent_type = path!(/datum);
         atom/var/alpha;
-        atom/var/appearance;
+        atom/var/tmp/appearance;  // not editable
         atom/var/appearance_flags;
         atom/var/blend_mode;
         atom/var/color;
-        atom/var/contents;
+        atom/var/contents;  // TODO: editable on movables only
         atom/var/density;
         atom/var/desc;
         atom/var/dir;
@@ -269,10 +428,10 @@ pub fn register_builtins(tree: &mut ObjectTree) -> Result<(), DMError> {
         atom/var/icon_state;
         atom/var/invisibility;
         atom/var/infra_luminosity;
-        atom/var/atom/loc;
+        atom/var/tmp/atom/loc;  // not editable
         atom/var/layer;
         atom/var/luminosity;
-        atom/var/maptext;
+        atom/var/maptext;  // all maptext vars not editable, but it's not obvious why
         atom/var/maptext_width;
         atom/var/maptext_height;
         atom/var/maptext_x;
@@ -284,8 +443,8 @@ pub fn register_builtins(tree: &mut ObjectTree) -> Result<(), DMError> {
         atom/var/mouse_opacity;
         atom/var/name;
         atom/var/opacity;
-        atom/var/overlays;
-        atom/var/override;
+        atom/var/tmp/overlays;  // not editable
+        //atom/var/override;  // listed under /atom but docs say /image only
         atom/var/pixel_x;
         atom/var/pixel_y;
         atom/var/pixel_w;
@@ -294,11 +453,11 @@ pub fn register_builtins(tree: &mut ObjectTree) -> Result<(), DMError> {
         atom/var/suffix;
         atom/var/text;
         atom/var/transform;
-        atom/var/underlays;
-        atom/var/verbs;
-        atom/var/x;
-        atom/var/y;
-        atom/var/z;
+        atom/var/tmp/underlays;  // not editable
+        atom/var/tmp/verbs;  // not editable
+        atom/var/tmp/x;  // not editable
+        atom/var/tmp/y;  // not editable
+        atom/var/tmp/z;  // not editable
         atom/proc/Click(location, control, params);
         atom/proc/DblClick(location, control, params);
         atom/proc/Enter(/*atom/movable*/O, /*atom*/oldloc);
@@ -322,7 +481,7 @@ pub fn register_builtins(tree: &mut ObjectTree) -> Result<(), DMError> {
         atom/movable/var/bound_y;
         atom/movable/var/bound_width;
         atom/movable/var/bound_height;
-        atom/movable/var/locs;
+        atom/movable/var/tmp/locs;  // not editable
         atom/movable/var/screen_loc;
         atom/movable/var/glide_size;
         atom/movable/var/step_size;
@@ -346,9 +505,9 @@ pub fn register_builtins(tree: &mut ObjectTree) -> Result<(), DMError> {
 
         mob/parent_type = path!(/atom/movable);
         mob/layer = int!(4);
-        mob/var/ckey;
-        mob/var/client/client;
-        mob/var/list/group;
+        mob/var/tmp/ckey;  // not editable, use key instead
+        mob/var/tmp/client/client;  // not editable
+        mob/var/list/group;  // not editable, but it's not obvious why
         mob/var/key;
         mob/var/see_infrared;
         mob/var/see_invisible;
@@ -359,43 +518,43 @@ pub fn register_builtins(tree: &mut ObjectTree) -> Result<(), DMError> {
 
         world;
         var/static/world/world;
-        world/var/static/address;
-        world/var/static/area/area = path!(/area);
-        world/var/static/cache_lifespan = int!(30);
-        world/var/static/contents;
-        world/var/static/cpu;
-        world/var/static/executor;
-        world/var/static/fps = int!(10);
-        world/var/static/game_state = int!(0);
-        world/var/static/host;
-        world/var/static/hub;
-        world/var/static/hub_password;
-        world/var/static/icon_size = int!(32);
-        world/var/static/internet_address;
-        world/var/static/log;
-        world/var/static/loop_checks = int!(1);
-        world/var/static/map_format = int!(0); // TOPDOWN_MAP
-        world/var/static/maxx;
-        world/var/static/maxy;
-        world/var/static/maxz;
-        world/var/static/mob/mob = path!(/mob);
-        world/var/static/name = Expression::from(Term::String("byond".into()));
-        world/var/static/params;
-        world/var/static/port;
-        world/var/static/realtime;
-        world/var/static/reachable;
-        world/var/static/sleep_offline = int!(0);
-        world/var/static/status;
-        world/var/static/system_type;
-        world/var/static/tick_lag = int!(1);
-        world/var/static/tick_usage;
-        world/var/static/turf/turf = path!(/turf);
-        world/var/static/time;
-        world/var/static/timeofday;
-        world/var/static/url;
-        world/var/static/version = int!(0);
-        world/var/static/view = int!(5);
-        world/var/static/visibility = int!(1);
+        world/var/address;
+        world/var/area/area = path!(/area);
+        world/var/cache_lifespan = int!(30);
+        world/var/contents;
+        world/var/cpu;
+        world/var/executor;
+        world/var/fps = int!(10);
+        world/var/game_state = int!(0);
+        world/var/host;
+        world/var/hub;
+        world/var/hub_password;
+        world/var/icon_size = int!(32);
+        world/var/internet_address;
+        world/var/log;
+        world/var/loop_checks = int!(1);
+        world/var/map_format = int!(0); // TOPDOWN_MAP
+        world/var/maxx;
+        world/var/maxy;
+        world/var/maxz;
+        world/var/mob/mob = path!(/mob);
+        world/var/name = Expression::from(Term::String("byond".into()));
+        world/var/params;
+        world/var/port;
+        world/var/realtime;
+        world/var/reachable;
+        world/var/sleep_offline = int!(0);
+        world/var/status;
+        world/var/system_type;
+        world/var/tick_lag = int!(1);
+        world/var/tick_usage;
+        world/var/turf/turf = path!(/turf);
+        world/var/time;
+        world/var/timeofday;
+        world/var/url;
+        world/var/version = int!(0);
+        world/var/view = int!(5);
+        world/var/visibility = int!(1);
 
         client;
         client/var/address;
@@ -416,11 +575,11 @@ pub fn register_builtins(tree: &mut ObjectTree) -> Result<(), DMError> {
         client/var/fps = int!(0);
         client/var/gender;
         client/var/glide_size = int!(0);
-        client/var/images;
+        client/var/list/images;
         client/var/inactivity;
         client/var/key;
         client/var/lazy_eye;
-        client/var/mob;
+        client/var/mob/mob;
         client/var/mouse_pointer_icon;
         client/var/perspective = int!(0);  // MOB_PERSPECTIVE
         client/var/pixel_x = int!(0);
@@ -428,7 +587,7 @@ pub fn register_builtins(tree: &mut ObjectTree) -> Result<(), DMError> {
         client/var/pixel_w = int!(0);
         client/var/pixel_z = int!(0);
         client/var/preload_rsc = int!(1);
-        client/var/screen;
+        client/var/list/screen;
         client/var/script;
         client/var/show_map = int!(1);
         client/var/show_popup_menus = int!(1);
@@ -436,7 +595,7 @@ pub fn register_builtins(tree: &mut ObjectTree) -> Result<(), DMError> {
         client/var/statobj;
         client/var/statpanel;
         client/var/tick_lag = int!(0);
-        client/var/verbs;
+        client/var/list/verbs;
         client/var/view;
         client/var/virtual_eye;
         client/proc/AllowUpload(filename, filelength);

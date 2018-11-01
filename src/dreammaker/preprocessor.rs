@@ -1,13 +1,14 @@
 //! The preprocessor.
 use std::collections::{HashMap, VecDeque};
-use std::io;
+use std::{io, fmt};
 use std::fs::File;
 use std::path::{Path, PathBuf};
 
 use interval_tree::{IntervalTree, range};
 
-use super::lexer::*;
 use super::{DMError, Location, HasLocation, FileId, Context, Severity};
+use super::lexer::*;
+use super::docs::{DocComment, DocTarget, DocCollection};
 
 // ----------------------------------------------------------------------------
 // Macro representation and predefined macros
@@ -16,12 +17,30 @@ use super::{DMError, Location, HasLocation, FileId, Context, Severity};
 pub enum Define {
     Constant {
         subst: Vec<Token>,
+        docs: DocCollection,
     },
     Function {
         params: Vec<String>,
         subst: Vec<Token>,
         variadic: bool,
+        docs: DocCollection,
     },
+}
+
+impl fmt::Display for Define {
+    fn fmt(&self, fmt: &mut fmt::Formatter) -> fmt::Result {
+        let subst = match self {
+            Define::Constant { ref subst, .. } |
+            Define::Function { ref subst, .. } => subst,
+        };
+        if subst.is_empty() {
+            fmt.write_str("(macro)")
+        } else if subst.len() == 1 {
+            write!(fmt, "{}", subst[0])
+        } else {
+            fmt.write_str("(macro...)")
+        }
+    }
 }
 
 /// An interval tree representing historic macro definitions.
@@ -96,12 +115,14 @@ impl DefineMap {
             return false;
         }
 
-        self.inner.iter().all(|(key, value)| rhs.inner.get(key).map_or(false, |v| {
-            if value.len() != v.len() {
-                return false;
-            }
-            value.iter().zip(v.iter()).all(|(lhs, rhs)| lhs.1 == rhs.1)
-        }))
+        self.inner.iter().all(|(key, value)| {
+            rhs.inner.get(key).map_or(false, |v| {
+                if value.len() != v.len() {
+                    return false;
+                }
+                value.iter().zip(v.iter()).all(|(lhs, rhs)| lhs.1 == rhs.1)
+            })
+        })
     }
 }
 
@@ -119,18 +140,22 @@ enum Include<'ctx> {
         name: String,
         location: Location,
         tokens: VecDeque<Token>,
-    }
+    },
 }
 
 impl<'ctx> Include<'ctx> {
-    fn new(context: &'ctx Context, path: PathBuf) -> io::Result<Include> {
+    fn from_file(context: &'ctx Context, path: PathBuf) -> io::Result<Include> {
         let reader = io::BufReader::new(File::open(&path)?);
-        let idx = context.register_file(path.clone());
-        Ok(Include::File {
-            lexer: Lexer::from_read(context, idx, Box::new(reader)),
+        Ok(Include::from_read(context, path, Box::new(reader)))
+    }
+
+    fn from_read(context: &'ctx Context, path: PathBuf, read: Box<io::Read>) -> Include {
+        let idx = context.register_file(&path);
+        Include::File {
             file: idx,
+            lexer: Lexer::from_read(context, idx, read),
             path: path,
-        })
+        }
     }
 }
 
@@ -187,11 +212,15 @@ impl<'ctx> Iterator for IncludeStack<'ctx> {
                     //Some(Err(e)) => return Some(Err(e)),
                     Some(t) => return Some(t),
                     None => {} // fall through
-                }
-                Some(&mut Include::Expansion { ref mut tokens, location, .. }) => match tokens.pop_front() {
+                },
+                Some(&mut Include::Expansion {
+                    ref mut tokens,
+                    location,
+                    ..
+                }) => match tokens.pop_front() {
                     Some(token) => return Some(LocatedToken { location, token }),
                     None => {} // fall through
-                }
+                },
                 None => return None,
             }
             self.stack.pop();
@@ -211,13 +240,25 @@ struct Ifdef {
 
 impl Ifdef {
     fn new(location: Location, active: bool) -> Ifdef {
-        Ifdef { location, active, chain_active: active }
+        Ifdef {
+            location,
+            active,
+            chain_active: active,
+        }
     }
     fn else_(self, location: Location) -> Ifdef {
-        Ifdef { location, active: !self.chain_active, chain_active: true }
+        Ifdef {
+            location,
+            active: !self.chain_active,
+            chain_active: true,
+        }
     }
     fn else_if(self, location: Location, active: bool) -> Ifdef {
-        Ifdef { location, active: !self.chain_active && active, chain_active: self.chain_active || active }
+        Ifdef {
+            location,
+            active: !self.chain_active && active,
+            chain_active: self.chain_active || active,
+        }
     }
 }
 
@@ -242,6 +283,9 @@ pub struct Preprocessor<'ctx> {
     last_printable_input_loc: Location,
     danger_idents: HashMap<String, Location>,
     in_interp_string: u32,
+
+    docs_in: VecDeque<(Location, DocComment)>,
+    docs_out: VecDeque<(Location, DocComment)>,
 }
 
 impl<'ctx> HasLocation for Preprocessor<'ctx> {
@@ -253,14 +297,26 @@ impl<'ctx> HasLocation for Preprocessor<'ctx> {
 impl<'ctx> Preprocessor<'ctx> {
     /// Create a new preprocessor from the given Context and environment file.
     pub fn new(context: &'ctx Context, env_file: PathBuf) -> io::Result<Self> {
-        let mut pp = Preprocessor {
+        // Buffer the entire environment file. Large environments take a while
+        // to load and locking it for the whole time is somewhat inconvenient.
+        let mut buffer = Vec::new();
+        {
+            use std::io::Read;
+            let mut file = File::open(&env_file)?;
+            file.read_to_end(&mut buffer)?;
+        }
+        let include = Include::from_read(context, env_file.clone(), Box::new(io::Cursor::new(buffer)));
+
+        // Load the built-in macros.
+        let mut defines = DefineMap::default();
+        super::builtins::default_defines(&mut defines);
+
+        Ok(Preprocessor {
             context,
-            env_file: env_file.clone(),
-            include_stack: IncludeStack {
-                stack: vec![Include::new(context, env_file)?],
-            },
+            env_file,
+            include_stack: IncludeStack { stack: vec![include] },
             history: Default::default(),
-            defines: Default::default(),
+            defines,
             maps: Default::default(),
             skins: Default::default(),
             scripts: Default::default(),
@@ -270,10 +326,10 @@ impl<'ctx> Preprocessor<'ctx> {
             last_printable_input_loc: Default::default(),
             output: Default::default(),
             danger_idents: Default::default(),
+            docs_in: Default::default(),
+            docs_out: Default::default(),
             in_interp_string: 0,
-        };
-        super::builtins::default_defines(&mut pp.defines);
-        Ok(pp)
+        })
     }
 
     /// Move all active defines to the define history.
@@ -297,6 +353,11 @@ impl<'ctx> Preprocessor<'ctx> {
     /// Access the define history. Will be incomplete until finalized.
     pub fn history(&self) -> &DefineHistory {
         &self.history
+    }
+
+    /// Access currently active defines.
+    pub fn defines_at(&self, location: Location) -> DefineMap {
+        DefineMap::from_history(&self.history, location)
     }
 
     /// Access the ifdef history.
@@ -325,6 +386,31 @@ impl<'ctx> Preprocessor<'ctx> {
             last_printable_input_loc: location,
             output: Default::default(),
             danger_idents: Default::default(),
+            docs_in: Default::default(),
+            docs_out: Default::default(),
+            in_interp_string: 0,
+        }
+    }
+
+    /// Branch a child preprocessor from this preprocessor's current state.
+    pub fn branch<'ctx2>(&self, context: &'ctx2 Context) -> Preprocessor<'ctx2> {
+        Preprocessor {
+            context: context,
+            env_file: self.env_file.clone(),
+            include_stack: Default::default(),
+            history: Default::default(),  // TODO: support branching a second time
+            defines: self.defines.clone(),
+            maps: Default::default(),
+            skins: Default::default(),
+            scripts: Default::default(),
+            ifdef_stack: Default::default(),  // should be fine
+            ifdef_history: Default::default(),
+            last_input_loc: self.last_input_loc,
+            last_printable_input_loc: self.last_printable_input_loc,
+            output: Default::default(),
+            danger_idents: Default::default(),
+            docs_in: Default::default(),
+            docs_out: Default::default(),
             in_interp_string: 0,
         }
     }
@@ -339,7 +425,7 @@ impl<'ctx> Preprocessor<'ctx> {
 
     /// Push a DM file to the top of this preprocessor's stack.
     pub fn push_file<R: io::Read + 'static>(&mut self, path: PathBuf, read: R) -> FileId {
-        let idx = self.context.register_file(path.clone());
+        let idx = self.context.register_file(&path);
         self.include_stack.stack.push(Include::File {
             lexer: Lexer::from_read(self.context, idx, Box::new(read)),
             file: idx,
@@ -392,7 +478,7 @@ impl<'ctx> Preprocessor<'ctx> {
             self.last_input_loc = tok.location;
 
             if let Token::Punct(Punctuation::Newline) = tok.token {
-                break
+                break;
             }
 
             if let Err(e) = self.real_next(tok.token, true) {
@@ -400,8 +486,10 @@ impl<'ctx> Preprocessor<'ctx> {
             }
         }
 
-        let mut parser = ::parser::Parser::new(self.context,
-            self.output.drain(..).map(|token| LocatedToken::new(start, token)));
+        let mut parser = ::parser::Parser::new(
+            self.context,
+            self.output.drain(..).map(|token| LocatedToken::new(start, token)),
+        );
         parser.set_fallback_location(start);
         let expr = parser.expression();
         let expr = parser.require(expr)?;
@@ -417,6 +505,14 @@ impl<'ctx> Preprocessor<'ctx> {
                 false
             }
         }
+    }
+
+    // ------------------------------------------------------------------------
+    // Doc comments
+
+    /// Something other than a `#define` was encountered, docs are not for us.
+    fn flush_docs(&mut self) {
+        self.docs_out.extend(self.docs_in.drain(..));
     }
 
     // ------------------------------------------------------------------------
@@ -441,10 +537,13 @@ impl<'ctx> Preprocessor<'ctx> {
         macro_rules! next {
             () => {
                 match self.inner_next() {
-                    Some(x) => { _last_expected_loc = x.location; x.token },
-                    None => return Err(self.error("unexpected EOF"))
+                    Some(x) => {
+                        _last_expected_loc = x.location;
+                        x.token
+                    }
+                    None => return Err(self.error("unexpected EOF")),
                 }
-            }
+            };
         }
         macro_rules! expect_token {
             (($($i:ident),*) = $p:pat) => {
@@ -505,38 +604,47 @@ impl<'ctx> Preprocessor<'ctx> {
                     "include" => {
                         expect_token!((path) = Token::String(path));
                         expect_token!(() = Token::Punct(Punctuation::Newline));
-                        #[cfg(windows)]
-                        let path = PathBuf::from(path);
-                        #[cfg(unix)]
                         let path = PathBuf::from(path.replace("\\", "/"));
 
-                        for each in vec![
+                        for candidate in vec![
                             self.env_file.parent().unwrap().join(&path),
                             self.include_stack.top_file_path().parent().unwrap().join(&path),
                             path,
                         ].into_iter().rev() {
-                            if !each.exists() { continue }
-                            // Wacky construct is used to let go of the borrow
-                            // of `each` so it can be used in the second half.
-                            enum FileType { DMM, DMF, DMS, DM }
-                            match match each.extension().and_then(|s| s.to_str()) {
+                            if !candidate.exists() {
+                                continue;
+                            }
+                            // Double-match is used to let go of the borrow of
+                            // `candidate` so it can be used in the second half.
+                            enum FileType {
+                                DMM,
+                                DMF,
+                                DMS,
+                                DM,
+                            }
+                            match match candidate.extension().and_then(|s| s.to_str()) {
                                 Some("dmm") => FileType::DMM,
                                 Some("dmf") => FileType::DMF,
                                 Some("dms") => FileType::DMS,
                                 Some("dm") => FileType::DM,
                                 Some(ext) => {
-                                    self.context.register_error(DMError::new(self.last_input_loc, format!("unknown extension {:?}", ext)));
+                                    self.context.register_error(DMError::new(
+                                        self.last_input_loc,
+                                        format!("unknown extension {:?}", ext),
+                                    ));
                                     return Ok(());
                                 }
                                 None => {
-                                    self.context.register_error(DMError::new(self.last_input_loc, "filename"));
+                                    self.context.register_error(DMError::new(self.last_input_loc, "filename has no extension"));
                                     return Ok(());
                                 }
                             } {
-                                FileType::DMM => self.maps.push(each),
-                                FileType::DMF => self.skins.push(each),
-                                FileType::DMS => self.scripts.push(each),
-                                FileType::DM => match Include::new(self.context, each) {
+                                FileType::DMM => self.maps.push(candidate),
+                                FileType::DMF => self.skins.push(candidate),
+                                FileType::DMS => self.scripts.push(candidate),
+                                // TODO: warn if a file is double-included, and
+                                // don't include it a second time
+                                FileType::DM => match Include::from_file(self.context, candidate) {
                                     Ok(include) => {
                                         // A phantom newline keeps the include
                                         // directive being indented from making
@@ -550,11 +658,29 @@ impl<'ctx> Preprocessor<'ctx> {
                             }
                             return Ok(());
                         }
-                        return Err(self.error("failed to find file"));
+                        self.context.register_error(DMError::new(self.last_input_loc, "failed to find file"));
+                        return Ok(());
                     }
                     // both constant and function defines
                     "define" if disabled => {}
                     "define" => {
+                        // accumulate just-seen Following doc comments
+                        let mut our_docs = Vec::new();
+                        while let Some((loc, doc)) = self.docs_in.pop_back() {
+                            if doc.target == DocTarget::FollowingItem {
+                                our_docs.push(doc);
+                            } else {
+                                self.docs_in.push_back((loc, doc));
+                                break;
+                            }
+                        }
+                        let mut docs = DocCollection::default();
+                        for each in our_docs.into_iter().rev() {
+                            docs.push(each);
+                        }
+                        // flush all docs which do not apply to this define
+                        self.flush_docs();
+
                         expect_token!((define_name, ws) = Token::Ident(define_name, ws));
                         let define_name_loc = _last_expected_loc;
                         self.check_danger_ident(&define_name, "defined");
@@ -574,7 +700,7 @@ impl<'ctx> Preprocessor<'ctx> {
                                                 params.push("__VA_ARGS__".to_owned());  // default
                                                 variadic = true;
                                             }
-                                            _ => return Err(self.error("malformed macro parameters, expected name"))
+                                            _ => return Err(self.error("malformed macro parameters, expected name")),
                                         }
                                         match next!() {
                                             Token::Punct(Punctuation::Comma) => {}
@@ -586,11 +712,12 @@ impl<'ctx> Preprocessor<'ctx> {
                                                     _ => return Err(self.error("only the last parameter of a macro may be variadic"))
                                                 }
                                             }
-                                            _ => return Err(self.error("malformed macro parameters, expected comma"))
+                                            _ => return Err(self.error("malformed macro parameters, expected comma")),
                                         }
                                     }
                                 }
                                 Token::Punct(Punctuation::Newline) => break 'outer,
+                                Token::DocComment(doc) => docs.push(doc),
                                 other => {
                                     subst.push(other);
                                 }
@@ -598,14 +725,15 @@ impl<'ctx> Preprocessor<'ctx> {
                             loop {
                                 match next!() {
                                     Token::Punct(Punctuation::Newline) => break 'outer,
+                                    Token::DocComment(doc) => docs.push(doc),
                                     other => subst.push(other),
                                 }
                             }
                         }
                         let define = if params.is_empty() {
-                            Define::Constant { subst }
+                            Define::Constant { subst, docs }
                         } else {
-                            Define::Function { params, subst, variadic }
+                            Define::Function { params, subst, variadic, docs }
                         };
                         // DEBUG can only be defined in the root .dme file
                         if define_name != "DEBUG" || self.in_environment() {
@@ -666,6 +794,8 @@ impl<'ctx> Preprocessor<'ctx> {
             _ if disabled => return Ok(()),
             // identifiers may be macros
             Token::Ident(ref ident, _) if ident != self.include_stack.top_no_expand() => {
+                self.flush_docs();
+
                 // lint for BYOND bug
                 if self.in_interp_string > 0 {
                     self.danger_idents.insert(ident.clone(), self.last_input_loc);
@@ -688,7 +818,7 @@ impl<'ctx> Preprocessor<'ctx> {
 
                 // if it's a define, perform the substitution
                 match self.defines.get(ident).cloned() { // TODO
-                    Some((_, Define::Constant { subst })) => {
+                    Some((_, Define::Constant { subst, docs: _ })) => {
                         let e = Include::Expansion {
                             name: ident.to_owned(),
                             tokens: subst.into_iter().collect(),
@@ -697,12 +827,17 @@ impl<'ctx> Preprocessor<'ctx> {
                         self.include_stack.stack.push(e);
                         return Ok(());
                     }
-                    Some((_, Define::Function { ref params, ref subst, variadic })) => {
+                    Some((_, Define::Function { ref params, ref subst, variadic, docs: _ })) => {
                         // if it's not followed by an LParen, it isn't really a function call
                         match next!() {
                             Token::Punct(Punctuation::LParen) => {}
                             other => {
                                 self.output.push_back(Token::Ident(ident.to_owned(), false));
+                                match other {
+                                    Token::InterpStringBegin(_) => self.in_interp_string += 1,
+                                    Token::InterpStringEnd(_) => self.in_interp_string -= 1,
+                                    _ => {}
+                                }
                                 self.output.push_back(other);
                                 return Ok(());
                             }
@@ -745,7 +880,7 @@ impl<'ctx> Preprocessor<'ctx> {
                             }
                         }
                         if args.len() != params.len() {
-                            return Err(self.error("wrong number of arguments to macro call"))
+                            return Err(self.error("wrong number of arguments to macro call"));
                         }
 
                         // paste them into the expansion
@@ -767,7 +902,10 @@ impl<'ctx> Preprocessor<'ctx> {
                                                     let mut arg = args[i].iter().cloned();
                                                     match arg.next() {
                                                         Some(Token::Ident(second, ws)) => {
-                                                            expansion.push_back(Token::Ident(format!("{}{}", first, second), ws));
+                                                            expansion.push_back(Token::Ident(
+                                                                format!("{}{}", first, second),
+                                                                ws,
+                                                            ));
                                                         }
                                                         Some(other) => {
                                                             expansion.push_back(Token::Ident(first, ws1));
@@ -834,8 +972,16 @@ impl<'ctx> Preprocessor<'ctx> {
             }
             Token::InterpStringBegin(_) => self.in_interp_string += 1,
             Token::InterpStringEnd(_) => self.in_interp_string -= 1,
+            // documentation is accumulated, and flushed if no #define follows
+            Token::DocComment(doc) => {
+                self.docs_in.push_back((self.last_input_loc, doc));
+                return Ok(());
+            },
             // everything else is itself
             _ => {}
+        }
+        if !read.is_whitespace() {
+            self.flush_docs();
         }
         self.output.push_back(read);
         Ok(())
@@ -847,6 +993,13 @@ impl<'ctx> Iterator for Preprocessor<'ctx> {
 
     fn next(&mut self) -> Option<LocatedToken> {
         loop {
+            if let Some((location, doc)) = self.docs_out.pop_front() {
+                return Some(LocatedToken {
+                    location,
+                    token: Token::DocComment(doc),
+                });
+            }
+
             if let Some(token) = self.output.pop_front() {
                 return Some(LocatedToken {
                     location: self.last_input_loc,

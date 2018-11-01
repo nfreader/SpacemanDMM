@@ -94,9 +94,6 @@ impl<'ctx, I> IndentProcessor<'ctx, I> where
             Token::Punct(Punctuation::LBrace) => self.current_spaces = None,
             Token::Punct(Punctuation::RBrace) => {
                 self.current_spaces = None;
-                if self.parentheses == 0 {
-                    self.push_semicolon();
-                }
             }
             _ => {}
         }
@@ -126,7 +123,9 @@ impl<'ctx, I> IndentProcessor<'ctx, I> where
                             // hope that truncating division will approximate
                             // a sane situation.
                             self.context.register_error(self.error(format!(
-                                "inconsistent indentation: {} % {} != 0", spaces, spaces_per_indent)));
+                                "inconsistent indentation: {} % {} != 0",
+                                spaces, spaces_per_indent
+                            )));
                         }
                         new_indents = spaces / spaces_per_indent;
                         self.current = Some((spaces_per_indent, new_indents));
@@ -140,17 +139,17 @@ impl<'ctx, I> IndentProcessor<'ctx, I> where
             } else if indents < new_indents {
                 // multiple indent is an error, register it but let it work
                 self.context.register_error(self.error(format!(
-                    "inconsistent multiple indentation: {} > 1", new_indents - indents)));
+                    "inconsistent multiple indentation: {} > 1",
+                    new_indents - indents,
+                )));
                 for _ in indents..new_indents {
                     self.push_eol(Token::Punct(Punctuation::LBrace));
                 }
             } else if indents == new_indents + 1 {
                 // single unindent
-                self.push_semicolon();
                 self.push(Token::Punct(Punctuation::RBrace));
             } else if indents > new_indents {
                 // multiple unindent
-                self.push_semicolon();
                 for _ in new_indents..indents {
                     self.push(Token::Punct(Punctuation::RBrace));
                 }
@@ -182,7 +181,7 @@ impl<'ctx, I> IndentProcessor<'ctx, I> where
                 self.parentheses += 1;
             }
             Token::Punct(Punctuation::RParen) => {
-                self.parentheses -= 1;
+                self.parentheses = self.parentheses.saturating_sub(1);
             }
             _ => {}
         }

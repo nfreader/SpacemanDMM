@@ -5,20 +5,48 @@ use std::fmt;
 use std::borrow::Cow;
 
 use super::{DMError, Location, HasLocation, FileId, Context, Severity};
+use super::docs::*;
 
 macro_rules! table {
-    ($(#[$attr:meta])* table $tabname:ident: $repr:ty => $enum_:ident; $($literal:expr, $name:ident;)*) => {
+    (
+        $(#[$attr:meta])* table $tabname:ident: $repr:ty => $enum_:ident;
+        $($literal:expr, $name:ident $(-> $close:ident)*;)*
+    ) => {
         $(#[$attr])*
         #[derive(Copy, Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
         pub enum $enum_ {
-            $($name,)*
+            $(
+                $name,
+                $($close,)*
+            )*
         }
 
         impl $enum_ {
             #[allow(dead_code)]
             fn value(self) -> $repr {
                 match self {
-                    $($enum_::$name => $literal,)*
+                    $(
+                        $enum_::$name => $literal,
+                        $($enum_::$close => $literal,)*
+                    )*
+                }
+            }
+
+            pub fn single_quoted(self) -> &'static str {
+                match self {
+                    $(
+                        $enum_::$name => concat!("'", $literal, "'"),
+                        $($enum_::$close => concat!("'", $literal, "'"),)*
+                    )*
+                }
+            }
+
+            fn close(self) -> Self {
+                match self {
+                    $(
+                        $($enum_::$name => $enum_::$close,)*
+                    )*
+                    _ => self,
                 }
             }
         }
@@ -35,78 +63,165 @@ table! {
     ///
     /// Not all punctuation types will actually appear in the lexer's output;
     /// some (such as comments) are handled internally.
-    table PUNCT_TABLE: &'static [u8] => Punctuation;
-    // Order is significant; see read_punct below.
-    b"\t",  Tab;
-    b"\n",  Newline;
-    b" ",   Space;
-    b"!",	Not;
-    b"!=",	NotEq;
-    b"\"",  DoubleQuote;
-    b"#",   Hash;
-    b"##",  TokenPaste;
-    b"%",	Mod;
-    b"%=",  ModAssign;
-    b"&",	BitAnd;
-    b"&&",	And;
-    b"&=",	BitAndAssign;
-    b"'",   SingleQuote;
-    b"(",	LParen;
-    b")",	RParen;
-    b"*",	Mul;
-    b"**",	Pow;
-    b"*=",	MulAssign;
-    b"+",	Add;
-    b"++",  PlusPlus;
-    b"+=",	AddAssign;
-    b",",	Comma;
-    b"-",	Sub;
-    b"--",  MinusMinus;
-    b"-=",	SubAssign;
-    b".",	Dot;
-    b"..",  Super;
-    b"...", Ellipsis;
-    b"/",	Slash;
-    b"/*",	BlockComment;
-    b"//",	LineComment;
-    b"/=",	DivAssign;
-    b":",	Colon;
-    b";",	Semicolon;
-    b"<",	Less;
-    b"<<",	LShift;
-    b"<<=",	LShiftAssign;
-    b"<=",	LessEq;
-    b"<>",	LessGreater;
-    b"=",	Assign;
-    b"==",	Eq;
-    b">",	Greater;
-    b">=",	GreaterEq;
-    b">>",	RShift;
-    b">>=",	RShiftAssign;
-    b"?",   QuestionMark;
-    b"?.",  SafeDot;
-    b"?:",  SafeColon;
-    b"[",	LBracket;
-    b"]",	RBracket;
-    b"^",	BitXor;
-    b"^=",	BitXorAssign;
-    b"{",	LBrace;
-    b"{\"", BlockString;
-    b"|",	BitOr;
-    b"|=",	BitOrAssign;
-    b"||",	Or;
-    b"}",	RBrace;
-    b"~",	BitNot;
-    b"~!",  NotEquiv;
-    b"~=",  Equiv;
+    table PUNCT_TABLE: &'static str => Punctuation;
+    // Order is significant; see filter_punct below.
+    "\t",  Tab;
+    "\n",  Newline;
+    " ",   Space;
+    "!",   Not;
+    "!=",  NotEq;
+    "\"",  DoubleQuote;
+    "#",   Hash;
+    "##",  TokenPaste;
+    "%",   Mod;
+    "%=",  ModAssign;
+    "&",   BitAnd;
+    "&&",  And;
+    "&=",  BitAndAssign;
+    "'",   SingleQuote;
+    "(",   LParen;
+    ")",   RParen;
+    "*",   Mul;
+    "**",  Pow;
+    "*=",  MulAssign;
+    "+",   Add;
+    "++",  PlusPlus;
+    "+=",  AddAssign;
+    ",",   Comma;
+    "-",   Sub;
+    "--",  MinusMinus;
+    "-=",  SubAssign;
+    ".",   Dot;
+    "..",  Super;
+    "...", Ellipsis;
+    "/",   Slash;
+    "/*",  BlockComment;
+    "//",  LineComment;
+    "/=",  DivAssign;
+    ":",   Colon -> CloseColon;
+    ";",   Semicolon;
+    "<",   Less;
+    "<<",  LShift;
+    "<<=", LShiftAssign;
+    "<=",  LessEq;
+    "<>",  LessGreater;
+    "=",   Assign;
+    "==",  Eq;
+    ">",   Greater;
+    ">=",  GreaterEq;
+    ">>",  RShift;
+    ">>=", RShiftAssign;
+    "?",   QuestionMark;
+    "?.",  SafeDot;
+    "?:",  SafeColon;
+    "[",   LBracket;
+    "]",   RBracket;
+    "^",   BitXor;
+    "^=",  BitXorAssign;
+    "{",   LBrace;
+    "{\"", BlockString;
+    "|",   BitOr;
+    "|=",  BitOrAssign;
+    "||",  Or;
+    "}",   RBrace;
+    "~",   BitNot;
+    "~!",  NotEquiv;
+    "~=",  Equiv;
     // Keywords - not checked by read_punct
-    b"in",  In;
+    "in",  In;
 }
 
 impl fmt::Display for Punctuation {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        f.write_str(::std::str::from_utf8(self.value()).unwrap())
+        f.write_str(self.value())
     }
+}
+
+/// This lookup table is used to keep `read_punct`, called for essentially each
+/// character in the input, blazing fast. The code to generate it is contained
+/// in the following test.
+static SPEEDY_TABLE: [(usize, usize); 127] = [
+    (0, 0), (0, 0), (0, 0), (0, 0), (0, 0), (0, 0), (0, 0), (0, 0),
+    (0, 0), (0, 1), (1, 2), (0, 0), (0, 0), (0, 0), (0, 0), (0, 0),
+    (0, 0), (0, 0), (0, 0), (0, 0), (0, 0), (0, 0), (0, 0), (0, 0),
+    (0, 0), (0, 0), (0, 0), (0, 0), (0, 0), (0, 0), (0, 0), (0, 0),
+    (2, 3), (3, 5), (5, 6), (6, 8), (0, 0), (8, 10), (10, 13), (13, 14),
+    (14, 15), (15, 16), (16, 19), (19, 22), (22, 23), (23, 26), (26, 29), (29, 33),
+    (0, 0), (0, 0), (0, 0), (0, 0), (0, 0), (0, 0), (0, 0), (0, 0),
+    (0, 0), (0, 0), (33, 34), (34, 35), (35, 40), (40, 42), (42, 46), (46, 49),
+    (0, 0), (0, 0), (0, 0), (0, 0), (0, 0), (0, 0), (0, 0), (0, 0),
+    (0, 0), (0, 0), (0, 0), (0, 0), (0, 0), (0, 0), (0, 0), (0, 0),
+    (0, 0), (0, 0), (0, 0), (0, 0), (0, 0), (0, 0), (0, 0), (0, 0),
+    (0, 0), (0, 0), (0, 0), (49, 50), (0, 0), (50, 51), (51, 53), (0, 0),
+    (0, 0), (0, 0), (0, 0), (0, 0), (0, 0), (0, 0), (0, 0), (0, 0),
+    (0, 0), (0, 0), (0, 0), (0, 0), (0, 0), (0, 0), (0, 0), (0, 0),
+    (0, 0), (0, 0), (0, 0), (0, 0), (0, 0), (0, 0), (0, 0), (0, 0),
+    (0, 0), (0, 0), (0, 0), (53, 55), (55, 58), (58, 59), (59, 62)];
+
+#[test]
+fn make_speedy_table() {
+    let everything: Vec<&str> = PUNCT_TABLE
+        .iter()
+        .map(|p| p.0)
+        .filter(|s| !s.chars().any(|c| c.is_alphanumeric()))
+        .collect();
+    for each in everything.iter() {
+        assert!(
+            each.len() == 1 || everything.contains(&&each[..each.len() - 1]),
+            "no prefix: {}",
+            each
+        );
+    }
+
+    let mut table = vec![];
+    for (i, (each, _)) in PUNCT_TABLE.iter().enumerate() {
+        if each.chars().any(|c| c.is_alphanumeric()) {
+            continue;
+        }
+
+        let b = each.as_bytes()[0] as usize;
+        if b >= table.len() {
+            table.resize(b + 1, (0, 0));
+        }
+        if table[b] == (0, 0) {
+            table[b].0 = i;
+            table[b].1 = i + 1;
+        } else {
+            assert!(i >= table[b].0);
+            assert_eq!(i, table[b].1, "{}", each);
+            table[b].1 = i + 1;
+        }
+    }
+
+    if &SPEEDY_TABLE[..] != &table[..] {
+        panic!(
+            "\n\nSpeedy table outdated, replace with:\n\nstatic SPEEDY_TABLE: [(usize, usize); {}] = {:?};\n\n",
+            table.len(),
+            table
+        );
+    }
+}
+
+#[inline]
+fn filter_punct_table<'a>(filter: u8) -> &'static [(&'static str, Punctuation)] {
+    let &(start, end) = SPEEDY_TABLE.get(filter as usize).unwrap_or(&(0, 0));
+    &PUNCT_TABLE[start..end]
+}
+
+#[inline]
+fn filter_punct<'a>(input: &'a [(&'static str, Punctuation)], filter: &[u8]) -> &'a [(&'static str, Punctuation)] {
+    // requires that PUNCT_TABLE be ordered, shorter entries be first,
+    // and all entries with >1 character also have their prefix in the table
+    let mut start = 0;
+    while start < input.len() && !input[start].0.as_bytes().starts_with(filter) {
+        start += 1;
+    }
+    let mut end = start;
+    while end < input.len() && input[end].0.as_bytes().starts_with(filter) {
+        end += 1;
+    }
+    //println!("{:?} -> {:?}", filter, &input[start..end]);
+    &input[start..end]
 }
 
 /// A single DM token.
@@ -132,6 +247,8 @@ pub enum Token {
     Int(i32),
     /// A floating-point literal.
     Float(f32),
+    /// A documentation comment.
+    DocComment(DocComment),
 }
 
 impl Token {
@@ -146,6 +263,7 @@ impl Token {
                 _ => continue,
             };
             match p {
+                In |
                 Eq |
                 NotEq |
                 Mod |
@@ -213,13 +331,66 @@ impl fmt::Display for Token {
             Eof => f.write_str("__EOF__"),
             Punct(p) => write!(f, "{}", p),
             Ident(ref i, _) => f.write_str(i),
-            String(ref i) => write!(f, "\"{}\"", i),
+            String(ref i) => Quote(i).fmt(f),
             InterpStringBegin(ref i) => write!(f, "\"{}[", i),
             InterpStringPart(ref i) => write!(f, "]{}[", i),
             InterpStringEnd(ref i) => write!(f, "]{}\"", i),
             Resource(ref i) => write!(f, "'{}'", i),
-            Int(i) => write!(f, "{}", i),
-            Float(i) => write!(f, "{}", i),
+            Int(i) => FormatFloat(i as f32).fmt(f),
+            Float(i) => FormatFloat(i).fmt(f),
+            DocComment(ref c) => write!(f, "{}", c),
+        }
+    }
+}
+
+/// Formatting helper to quote a string according to DM's rules.
+///
+/// Assumes that escapes within the string have NOT been parsed
+pub struct Quote<'a>(pub &'a str);
+
+impl<'a> fmt::Display for Quote<'a> {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        let s = self.0;
+        if s.contains("\"}") {
+            write!(f, "@@{}@", s)
+        } else if s.contains("\"") || s.contains("\n") {
+            write!(f, "{{\"{}\"}}", s)
+        } else {
+            write!(f, "\"{}\"", s)
+        }
+    }
+}
+
+/// Formatting helper to format a float according to DM's rules.
+pub struct FormatFloat(pub f32);
+
+impl fmt::Display for FormatFloat {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        let n = self.0;
+        if n.is_nan() {
+            // Not sure what is actually correct here.
+            f.write_str("1.#NaN")
+        } else if n.is_infinite() {
+            if n.is_sign_negative() {
+                f.write_str("-1.#INF")
+            } else {
+                f.write_str("1.#INF")
+            }
+        } else if n == 0.0 {
+            f.write_str("0")
+        } else {
+            let exp = n.abs().log10().floor();
+            if exp >= 6.0 || exp <= -5.0 {
+                let n2 = (n * 10.0f32.powf(5.0 - exp)).round() * 1.0e-5;
+                let mut precision = 0;
+                while precision < 5 && (n2 * 10.0f32.powi(precision)) != (n2 * 10.0f32.powi(precision)).round() {
+                    precision += 1;
+                }
+                write!(f, "{:.*}e{:+04}", precision as usize, n2, exp)
+            } else {
+                let n2 = (n * 10.0f32.powf(5.0 - exp)).round() * 10.0f32.powf(exp - 5.0);
+                write!(f, "{}", n2)
+            }
         }
     }
 }
@@ -364,9 +535,7 @@ impl<I: Iterator<Item=io::Result<u8>>> Iterator for LocationTracker<I> {
                 }
                 Some(Ok(ch))
             }
-            Some(Err(e)) => {
-                Some(Err(DMError::new(self.location, "i/o error").set_cause(e)))
-            }
+            Some(Err(e)) => Some(Err(DMError::new(self.location, "i/o error").set_cause(e))),
         }
     }
 }
@@ -378,6 +547,7 @@ pub struct Lexer<'ctx, I> {
     next: Option<u8>,
     final_newline: bool,
     at_line_head: bool,
+    close_allowed: bool,
     directive: Directive,
     interp_stack: Vec<Interpolation>,
 }
@@ -419,6 +589,7 @@ impl<'ctx, I: Iterator<Item=io::Result<u8>>> Lexer<'ctx, I> {
             next: None,
             final_newline: false,
             at_line_head: true,
+            close_allowed: true,
             directive: Directive::None,
             interp_stack: Vec::new(),
         }
@@ -458,10 +629,20 @@ impl<'ctx, I: Iterator<Item=io::Result<u8>>> Lexer<'ctx, I> {
         self.next = val;
     }
 
-    fn skip_block_comments(&mut self) {
+    fn skip_block_comments(&mut self) -> Option<Token> {
         let mut depth = 1;
         let mut buffer = [0, 0];
-        while depth > 0 {
+
+        // read the first character and check for being a comment
+        let mut comment = None;
+        match self.next() {
+            Some(b'*') => comment = Some(DocComment::new(CommentKind::Block, DocTarget::FollowingItem)),
+            Some(b'!') => comment = Some(DocComment::new(CommentKind::Block, DocTarget::EnclosingItem)),
+            Some(ch) => buffer[1] = ch,
+            None => {}
+        }
+
+        loop {
             // read one character
             buffer[0] = buffer[1];
             match self.next() {
@@ -476,26 +657,60 @@ impl<'ctx, I: Iterator<Item=io::Result<u8>>> Lexer<'ctx, I> {
                 depth += 1;
             } else if buffer == *b"*/" {
                 depth -= 1;
+                if depth == 0 {
+                    break;
+                }
+            }
+
+            if buffer[0] != 0 {
+                if let Some(ref mut comment) = comment {
+                    comment.text.push(buffer[0] as char);
+                }
             }
         }
+
+        comment.map(Token::DocComment)
     }
 
-    fn skip_line_comment(&mut self) {
+    fn skip_line_comment(&mut self) -> Option<Token> {
         let mut backslash = false;
+
+        // read the first character and check for being a comment
+        let mut comment = None;
+        match self.next() {
+            Some(b'/') => comment = Some(DocComment::new(CommentKind::Line, DocTarget::FollowingItem)),
+            Some(b'!') => comment = Some(DocComment::new(CommentKind::Line, DocTarget::EnclosingItem)),
+            Some(b'\n') => {
+                self.put_back(Some(b'\n'));
+                return None;
+            }
+            Some(b'\\') => backslash = true,
+            _ => {}
+        }
+
         while let Some(ch) = self.next() {
+            if ch != b'\r' && ch != b'\n' {
+                if let Some(ref mut comment) = comment {
+                    comment.text.push(ch as char);
+                }
+            }
+
             if ch == b'\r' {
                 // not listening
             } else if backslash {
                 backslash = false;
             } else if ch == b'\n' {
-                break
+                self.put_back(Some(ch));
+                break;
             } else if ch == b'\\' {
                 backslash = true;
             }
         }
+
+        comment.map(Token::DocComment)
     }
 
-    fn read_number_inner(&mut self, first: u8) -> (bool, u32, String) {
+    fn read_number_inner(&mut self, first: u8) -> (bool, u32, Cow<'static, str>) {
         let mut integer = true;
         let mut exponent = false;
         let mut radix = 10;
@@ -514,9 +729,9 @@ impl<'ctx, I: Iterator<Item=io::Result<u8>>> Lexer<'ctx, I> {
         loop {
             match self.next() {
                 Some(b'_') => {},
-                Some(ch) if ch == b'.' || ch == b'e' => {
+                Some(ch) if ch == b'.' || ch == b'e' || ch == b'E' => {
                     integer = false;
-                    exponent |= ch == b'e';
+                    exponent |= ch == b'e' || ch == b'E';
                     buf.push(ch as char);
                 }
                 Some(ch) if (ch == b'+' || ch == b'-') && exponent => {
@@ -532,10 +747,10 @@ impl<'ctx, I: Iterator<Item=io::Result<u8>>> Lexer<'ctx, I> {
                         }
                         // Not what we expected, throw it up the line so that
                         // f32::from_str will error.
-                        return (false, 10, buf);
+                        return (false, 10, buf.into());
                     }
                     // Got "1.#INF", change it to "inf" for read_number.
-                    return (false, 10, "inf".to_owned());
+                    return (false, 10, "inf".into());
                 }
                 Some(ch) if (ch as char).is_digit(::std::cmp::max(radix, 10)) => {
                     exponent = false;
@@ -543,7 +758,7 @@ impl<'ctx, I: Iterator<Item=io::Result<u8>>> Lexer<'ctx, I> {
                 }
                 ch => {
                     self.put_back(ch);
-                    return (integer, radix, buf);
+                    return (integer, radix, buf.into());
                 }
             }
         }
@@ -587,11 +802,16 @@ impl<'ctx, I: Iterator<Item=io::Result<u8>>> Lexer<'ctx, I> {
     }
 
     fn read_ident(&mut self, first: u8) -> String {
-        let mut ident = vec![first];
+        // 12 is ~89% of idents, 24 is ~99.5%, 48 is ~100%
+        let mut ident = Vec::with_capacity(12);
+        ident.push(first);
         loop {
             match self.next() {
                 Some(ch) if is_ident(ch) || is_digit(ch) => ident.push(ch),
-                ch => { self.put_back(ch); break }
+                ch => {
+                    self.put_back(ch);
+                    break;
+                }
             }
         }
         from_latin1(ident)
@@ -631,9 +851,9 @@ impl<'ctx, I: Iterator<Item=io::Result<u8>>> Lexer<'ctx, I> {
             if ch == end[idx] && !backslash {
                 idx += 1;
                 if idx == end.len() {
-                    break
+                    break;
                 }
-                continue
+                continue;
             } else if ch == end[0] && !backslash {
                 // TODO: this is a hack to fix the '""}' situation
                 buf.extend_from_slice(&end[..idx]);
@@ -682,33 +902,48 @@ impl<'ctx, I: Iterator<Item=io::Result<u8>>> Lexer<'ctx, I> {
     }
 
     fn read_punct(&mut self, first: u8) -> Option<Punctuation> {
-        // requires that PUNCT_TABLE be ordered, shorter entries be first,
-        // and all entries with >1 character also have their prefix in the table
-        let mut items: Vec<_> = PUNCT_TABLE.iter()
-            .skip_while(|&&(tok, _)| tok[0] < first)
-            .take_while(|&&(tok, _)| tok[0] == first)
-            .collect();
-        if items.is_empty() {
-            return None
-        }
+        let mut needle = [first, 0, 0, 0, 0, 0, 0, 0];  // poor man's StackVec
+        let mut needle_idx = 1;
 
-        let mut candidate;
-        let mut needle = vec![first];
-        loop {
-            candidate = Some(items[0].1);
-            if items.len() == 1 {
-                return candidate
+        let mut items = filter_punct_table(first);
+        let mut candidate = None;
+        while !items.is_empty() {
+            if items[0].0.as_bytes() == &needle[..needle_idx] {
+                candidate = Some(items[0].1);
             }
+            if items.len() == 1 {
+                return candidate;
+            }
+
             match self.next() {
-                Some(b) => needle.push(b),
+                Some(b) => {
+                    needle[needle_idx] = b;
+                    needle_idx += 1;
+                },
                 None => return candidate,  // EOF
             }
-            items.retain(|&&(tok, _)| tok.starts_with(&needle));
-            if items.is_empty() {
-                self.put_back(needle.last().cloned());
-                return candidate
-            }
+            items = filter_punct(items, &needle[..needle_idx]);
         }
+        if needle_idx > 1 {
+            self.put_back(needle[..needle_idx].last().cloned());
+        }
+        candidate
+    }
+
+    fn check_close(&mut self, mut punct: Punctuation) -> Punctuation {
+        let close = punct.close();
+        if punct != close {
+            let next = self.next();
+            match next {
+                Some(b'\r') |
+                Some(b' ') |
+                Some(b'\t') |
+                Some(b'\n') => {}
+                _ => punct = close,
+            }
+            self.put_back(next);
+        }
+        punct
     }
 
     fn skip_ws(&mut self, skip_newlines: bool) -> Option<u8> {
@@ -717,8 +952,8 @@ impl<'ctx, I: Iterator<Item=io::Result<u8>>> Lexer<'ctx, I> {
             match self.next() {
                 Some(b'\r') => {},
                 Some(b' ') |
-                Some(b'\t') if !self.at_line_head || skip_newlines > 0 => {},
-                Some(b'\n') if skip_newlines == 2 => { skip_newlines = 1; },
+                Some(b'\t') if !self.at_line_head || skip_newlines > 0 => { self.close_allowed = false; },
+                Some(b'\n') if skip_newlines == 2 => { skip_newlines = 1; self.close_allowed = true; },
                 ch => return ch
             }
         }
@@ -745,7 +980,7 @@ impl<'ctx, I: Iterator<Item=io::Result<u8>>> Iterator for Lexer<'ctx, I> {
                         return Some(LocatedToken {
                             location: location,
                             token: Token::Punct(Punctuation::Newline),
-                        })
+                        });
                     } else {
                         return None;
                     }
@@ -762,19 +997,26 @@ impl<'ctx, I: Iterator<Item=io::Result<u8>>> Iterator for Lexer<'ctx, I> {
                 return Some(locate(self.read_string(b"\n", false)));
             }
 
-            let punct = self.read_punct(first);
+            let mut punct = self.read_punct(first);
+            if self.close_allowed {
+                punct = punct.map(|p| self.check_close(p));
+            }
             return match punct {
                 Some(Hash) if self.directive == Directive::None => {
                     self.directive = Directive::Hash;
                     Some(locate(Punct(Hash)))
                 }
                 Some(BlockComment) => {
-                    self.skip_block_comments();
+                    if let Some(t) = self.skip_block_comments() {
+                        return Some(locate(t));
+                    }
                     continue;
                 }
                 Some(LineComment) => {
-                    self.skip_line_comment();
-                    Some(locate(Punct(Newline)))
+                    if let Some(t) = self.skip_line_comment() {
+                        return Some(locate(t));
+                    }
+                    continue;
                 }
                 Some(SingleQuote) => Some(locate(Resource(self.read_resource()))),
                 Some(DoubleQuote) => Some(locate(self.read_string(b"\"", false))),
@@ -793,7 +1035,12 @@ impl<'ctx, I: Iterator<Item=io::Result<u8>>> Iterator for Lexer<'ctx, I> {
                         }
                         self.interp_stack.push(interp);
                     }
+                    self.close_allowed = true;
                     Some(locate(Punct(RBracket)))
+                }
+                Some(RParen) => {
+                    self.close_allowed = true;
+                    Some(locate(Punct(RParen)))
                 }
                 Some(v) => Some(locate(Punct(v))),
                 None => match first {
@@ -812,10 +1059,11 @@ impl<'ctx, I: Iterator<Item=io::Result<u8>>> Iterator for Lexer<'ctx, I> {
                         }
                         // check keywords
                         for &(name, value) in PUNCT_TABLE.iter() {
-                            if name == ident.as_bytes() {
-                                return Some(locate(Punct(value)))
+                            if name == ident {
+                                return Some(locate(Punct(value)));
                             }
                         }
+                        self.close_allowed = true;
                         Some(locate(Ident(ident, ws)))
                     }
                     b'\\' => {
@@ -831,8 +1079,8 @@ impl<'ctx, I: Iterator<Item=io::Result<u8>>> Iterator for Lexer<'ctx, I> {
                         }
                         continue;
                     }
-                }
-            }
+                },
+            };
         }
     }
 }

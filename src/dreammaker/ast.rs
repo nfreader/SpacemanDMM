@@ -6,6 +6,8 @@ use std::iter::FromIterator;
 
 use linked_hash_map::LinkedHashMap;
 
+use error::Location;
+
 /// The unary operators, both prefix and postfix.
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
 pub enum UnaryOp {
@@ -50,7 +52,7 @@ impl<'a, T: fmt::Display> fmt::Display for Around<'a, T> {
 /// The DM path operators.
 ///
 /// Which path operator is used typically only matters at the start of a path.
-#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+#[derive(Copy, Clone, Hash, PartialEq, Eq, Debug)]
 pub enum PathOp {
     /// `/` for absolute pathing.
     Slash,
@@ -69,6 +71,9 @@ impl fmt::Display for PathOp {
         }
     }
 }
+
+/// A (typically absolute) tree path where the path operator is irrelevant.
+pub type TreePath = Vec<String>;
 
 /// A series of identifiers separated by path operators.
 pub type TypePath = Vec<(PathOp, String)>;
@@ -98,6 +103,7 @@ pub enum BinaryOp {
     And,
     Or,
     In,
+    To,  // only appears in RHS of `In`
 }
 
 impl fmt::Display for BinaryOp {
@@ -126,6 +132,7 @@ impl fmt::Display for BinaryOp {
             And => "&&",
             Or => "||",
             In => "in",
+            To => "to",
         })
     }
 }
@@ -201,10 +208,19 @@ augmented! {
 }
 
 /// A path optionally followed by a set of variables.
-#[derive(Clone, PartialEq, Debug)]
+#[derive(Clone, Hash, Eq, PartialEq, Debug)]
 pub struct Prefab<E=Expression> {
     pub path: TypePath,
     pub vars: LinkedHashMap<String, E>,
+}
+
+impl<E> From<TypePath> for Prefab<E> {
+    fn from(path: TypePath) -> Self {
+        Prefab {
+            path,
+            vars: Default::default(),
+        }
+    }
 }
 
 impl<E: fmt::Display> fmt::Display for Prefab<E> {
@@ -229,7 +245,7 @@ impl<E: fmt::Display> fmt::Display for Prefab<E> {
 }
 
 /// The different forms of the `new` command.
-#[derive(Clone, PartialEq, Debug)]
+#[derive(Clone, Hash, Eq, PartialEq, Debug)]
 pub enum NewType<E=Expression> {
     /// Implicit type, taken from context.
     Implicit,
@@ -291,6 +307,31 @@ pub enum Expression {
     }
 }
 
+impl Expression {
+    /// If this expression consists of a single term, return it.
+    pub fn as_term(&self) -> Option<&Term> {
+        match self {
+            &Expression::Base { ref unary, ref follow, ref term }
+                if unary.is_empty() && follow.is_empty() => Some(term),
+            _ => None,
+        }
+    }
+
+    /// If this expression consists of a single term, return it.
+    pub fn into_term(self) -> Option<Term> {
+        match self {
+            Expression::Base { unary, follow, term } => {
+                if unary.is_empty() && follow.is_empty() {
+                    Some(term)
+                } else {
+                    None
+                }
+            },
+            _ => None,
+        }
+    }
+}
+
 impl From<Term> for Expression {
     fn from(term: Term) -> Expression {
         match term {
@@ -299,7 +340,7 @@ impl From<Term> for Expression {
                 unary: vec![],
                 follow: vec![],
                 term,
-            }
+            },
         }
     }
 }
@@ -329,10 +370,14 @@ pub enum Term {
         args: Vec<Expression>,
         in_list: Option<Box<Expression>>, // in
     },
+    /// A `pick` call, possibly with weights.
+    Pick(Vec<(Option<Expression>, Expression)>),
     /// An unscoped function call.
     Call(String, Vec<Expression>),
     /// A `..()` call. If arguments is empty, the proc's arguments are passed.
     ParentCall(Vec<Expression>),
+    /// A `.()` call.
+    SelfCall(Vec<Expression>),
     /// A prefab literal (path + vars).
     Prefab(Prefab),
     /// An identifier.
@@ -347,8 +392,6 @@ pub enum Term {
     Float(f32),
     /// An expression contained in a term.
     Expr(Box<Expression>),
-    /// The current proc's return value (`.`).
-    ReturnValue,
     /// A use of the `call()()` primitive.
     DynamicCall(Vec<Expression>, Vec<Expression>),
     /// An interpolated string, alternating string/expr/string/expr.
@@ -366,7 +409,7 @@ impl From<Expression> for Term {
             } else {
                 Term::Expr(Box::new(Expression::Base { term, unary, follow }))
             },
-            other => Term::Expr(Box::new(other))
+            other => Term::Expr(Box::new(other)),
         }
     }
 }
@@ -382,6 +425,28 @@ pub enum IndexKind {
     SafeDot,
     /// `a?:b`
     SafeColon,
+}
+
+impl IndexKind {
+    pub fn len(self) -> usize {
+        match self {
+            IndexKind::Dot |
+            IndexKind::Colon => 1,
+            IndexKind::SafeDot |
+            IndexKind::SafeColon => 2,
+        }
+    }
+}
+
+impl fmt::Display for IndexKind {
+    fn fmt(&self, fmt: &mut fmt::Formatter) -> fmt::Result {
+        fmt.write_str(match *self {
+            IndexKind::Dot => ".",
+            IndexKind::Colon => ":",
+            IndexKind::SafeDot => "?.",
+            IndexKind::SafeColon => "?:",
+        })
+    }
 }
 
 /// An expression part which is applied to a term or another follow.
@@ -403,6 +468,7 @@ pub struct Parameter {
     pub default: Option<Expression>,
     pub input_type: InputType,
     pub in_list: Option<Expression>,
+    pub location: Location,
 }
 
 impl fmt::Display for Parameter {
@@ -486,7 +552,7 @@ pub struct VarType {
     pub is_static: bool,
     pub is_const: bool,
     pub is_tmp: bool,
-    pub type_path: TypePath,
+    pub type_path: TreePath,
 }
 
 impl VarType {
@@ -494,31 +560,57 @@ impl VarType {
     pub fn is_const_evaluable(&self) -> bool {
         self.is_const || (!self.is_static && !self.is_tmp)
     }
+
+    #[inline]
+    pub fn is_normal(&self) -> bool {
+        !(self.is_static || self.is_const || self.is_tmp)
+    }
 }
 
 impl FromIterator<String> for VarType {
     fn from_iter<T: IntoIterator<Item=String>>(iter: T) -> Self {
-        Self::from_iter(iter.into_iter().map(|p| (PathOp::Slash, p)))
-    }
-}
-
-impl FromIterator<(PathOp, String)> for VarType {
-    fn from_iter<T: IntoIterator<Item=(PathOp, String)>>(iter: T) -> Self {
         let (mut is_static, mut is_const, mut is_tmp) = (false, false, false);
-        let type_path = iter.into_iter()
-            .skip_while(|(_, p)| {
+        let type_path = iter
+            .into_iter()
+            .skip_while(|p| {
                 if p == "global" || p == "static" {
-                    is_static = true; true
+                    is_static = true;
+                    true
                 } else if p == "const" {
-                    is_const = true; true
+                    is_const = true;
+                    true
                 } else if p == "tmp" {
-                    is_tmp = true; true
+                    is_tmp = true;
+                    true
                 } else {
                     false
                 }
-            })
-            .collect();
-        VarType { is_static, is_const, is_tmp, type_path }
+            }).collect();
+        VarType {
+            is_static,
+            is_const,
+            is_tmp,
+            type_path,
+        }
+    }
+}
+
+impl fmt::Display for VarType {
+    fn fmt(&self, fmt: &mut fmt::Formatter) -> fmt::Result {
+        if self.is_static {
+            fmt.write_str("/static")?;
+        }
+        if self.is_const {
+            fmt.write_str("/const")?;
+        }
+        if self.is_tmp {
+            fmt.write_str("/tmp")?;
+        }
+        for bit in self.type_path.iter() {
+            fmt.write_str("/")?;
+            fmt.write_str(bit)?;
+        }
+        Ok(())
     }
 }
 
@@ -554,14 +646,26 @@ pub enum Statement {
         step: Option<Expression>,
         block: Vec<Statement>,
     },
-    Var {
-        var_type: VarType,
-        name: String,
-        value: Option<Expression>,
-    },
+    Var(VarStatement),
+    Vars(Vec<VarStatement>),
     Setting(String, SettingMode, Expression),
     Spawn(Option<Expression>, Vec<Statement>),
     Switch(Expression, Vec<(Vec<Case>, Vec<Statement>)>, Option<Vec<Statement>>),
+    TryCatch {
+        try_block: Vec<Statement>,
+        catch_params: Vec<TreePath>,
+        catch_block: Vec<Statement>,
+    },
+    Continue(Option<String>),
+    Break(Option<String>),
+    Label(String, Vec<Statement>),
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct VarStatement {
+    pub var_type: VarType,
+    pub name: String,
+    pub value: Option<Expression>,
 }
 
 #[derive(Debug, Clone, PartialEq)]

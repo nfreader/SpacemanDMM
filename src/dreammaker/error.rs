@@ -42,8 +42,8 @@ pub struct Context {
 
 impl Context {
     /// Add a new file to the context and return its index.
-    pub fn register_file(&self, path: PathBuf) -> FileId {
-        if let Some(id) = self.reverse_files.borrow().get(&path).cloned() {
+    pub fn register_file(&self, path: &Path) -> FileId {
+        if let Some(id) = self.reverse_files.borrow().get(path).cloned() {
             return id;
         }
         let mut files = self.files.borrow_mut();
@@ -51,9 +51,9 @@ impl Context {
             panic!("file limit of {} exceeded", FILEID_MAX.0);
         }
         let len = files.len() as u16;
-        files.push(path.clone());
+        files.push(path.to_owned());
         let id = FileId(len + FILEID_MIN.0);
-        self.reverse_files.borrow_mut().insert(path, id);
+        self.reverse_files.borrow_mut().insert(path.to_owned(), id);
         id
     }
 
@@ -81,7 +81,8 @@ impl Context {
         if let Some(severity) = self.print_severity {
             if error.severity <= severity {
                 let stderr = io::stderr();
-                self.pretty_print_error(&mut stderr.lock(), &error).expect("error writing to stderr");
+                self.pretty_print_error(&mut stderr.lock(), &error)
+                    .expect("error writing to stderr");
             }
         }
         self.errors.borrow_mut().push(error);
@@ -99,11 +100,14 @@ impl Context {
 
     /// Pretty-print a `DMError` to the given output.
     pub fn pretty_print_error<W: io::Write>(&self, w: &mut W, error: &DMError) -> io::Result<()> {
-        writeln!(w, "{}, line {}, column {}:",
+        writeln!(
+            w,
+            "{}, line {}, column {}:",
             self.file_path(error.location.file).display(),
             error.location.line,
-            error.location.column)?;
-        writeln!(w, "{}: {}\n", error.severity, error.desc)
+            error.location.column,
+        )?;
+        writeln!(w, "{}: {}\n", error.severity, error.description)
     }
 
     /// Pretty-print all registered diagnostics to standard error.
@@ -169,6 +173,10 @@ impl Location {
         }
         self
     }
+
+    pub fn is_builtins(self) -> bool {
+        self.file == FileId::builtins()
+    }
 }
 
 /// A trait for types which may yield location information.
@@ -184,11 +192,15 @@ pub trait HasLocation {
 }
 
 impl<'a, T: HasLocation> HasLocation for &'a T {
-    fn location(&self) -> Location { (**self).location() }
+    fn location(&self) -> Location {
+        (**self).location()
+    }
 }
 
 impl<'a, T: HasLocation> HasLocation for &'a mut T {
-    fn location(&self) -> Location { (**self).location() }
+    fn location(&self) -> Location {
+        (**self).location()
+    }
 }
 
 // ----------------------------------------------------------------------------
@@ -225,8 +237,8 @@ impl fmt::Display for Severity {
 pub struct DMError {
     location: Location,
     severity: Severity,
-    desc: String,
-    cause: Option<Box<error::Error + Send>>,
+    description: String,
+    cause: Option<Box<error::Error + Send + Sync>>,
 }
 
 #[allow(unused_variables)]
@@ -235,12 +247,12 @@ impl DMError {
         DMError {
             location,
             severity: Default::default(),
-            desc: desc.into(),
+            description: desc.into(),
             cause: None,
         }
     }
 
-    pub fn set_cause<E: error::Error + Send + 'static>(mut self, cause: E) -> DMError {
+    pub fn set_cause<E: error::Error + Send + Sync + 'static>(mut self, cause: E) -> DMError {
         self.cause = Some(Box::new(cause));
         self
     }
@@ -262,24 +274,24 @@ impl DMError {
 
     /// Get the description associated with this error.
     pub fn description(&self) -> &str {
-        &self.desc
+        &self.description
     }
 
     /// Deconstruct this error, returning only the description.
     pub fn into_description(self) -> String {
-        self.desc
+        self.description
     }
 }
 
 impl fmt::Display for DMError {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(f, "{}:{}:{}", self.location.line, self.location.column, self.desc)
+        write!(f, "{}:{}:{}", self.location.line, self.location.column, self.description)
     }
 }
 
 impl error::Error for DMError {
     fn description(&self) -> &str {
-        &self.desc
+        &self.description
     }
 
     fn cause(&self) -> Option<&error::Error> {

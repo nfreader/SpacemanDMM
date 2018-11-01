@@ -14,20 +14,20 @@ impl Query {
     /// Parse a symbol query.
     pub fn parse(query: &str) -> Option<Query> {
         if !any_alphanumeric(query) {
-            return None
+            return None;
         }
         Some(if query.starts_with("#") {
             Query::Define(query[1..].to_lowercase())
         } else if query.starts_with("var/") {
             let query = &query["var/".len()..];
             if !any_alphanumeric(query) {
-                return None
+                return None;
             }
             Query::Var(query.to_lowercase())
         } else if query.starts_with("proc/") {
             let query = &query["proc/".len()..];
             if !any_alphanumeric(query) {
-                return None
+                return None;
             }
             Query::Proc(query.to_lowercase())
         } else if query.contains("/") {
@@ -80,12 +80,27 @@ impl Query {
     }
 }
 
-// ignore case and underscores
-fn starts_with<'a>(fulltext: &'a str, query: &'a str) -> bool {
-    let simplify = |s: &'a str| s.chars().flat_map(|c| c.to_lowercase()).filter(|c| c.is_alphanumeric());
+fn simplify<'a>(s: &'a str) -> impl Iterator<Item=char> + Clone + 'a {
+    s.chars().flat_map(|c| c.to_lowercase()).filter(|c| c.is_alphanumeric())
+}
 
+// ignore case and underscores
+pub fn starts_with<'a>(fulltext: &'a str, query: &'a str) -> bool {
     let mut query_chars = simplify(query);
     simplify(fulltext).zip(&mut query_chars).all(|(a, b)| a == b) && query_chars.next().is_none()
+}
+
+pub fn contains<'a>(fulltext: &'a str, query: &'a str) -> bool {
+    let (mut fulltext, query) = (simplify(fulltext), simplify(query));
+    loop {
+        let mut clone = query.clone();
+        if fulltext.clone().zip(&mut clone).all(|(a, b)| a == b) && clone.next().is_none() {
+            return true;
+        }
+        if fulltext.next().is_none() {
+            return false;
+        }
+    }
 }
 
 fn any_alphanumeric(text: &str) -> bool {

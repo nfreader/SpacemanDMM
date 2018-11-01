@@ -1,11 +1,11 @@
 [workspace]
 members = [
     "src/cli",
+    "src/dmdoc",
     "src/dreammaker",
-    #"src/editor",
+    "src/editor",
     "src/interval-tree",
     "src/langserver",
-    #"src/qt-extras",
     "src/tools",
 ]
 

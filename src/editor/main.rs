@@ -1,547 +1,1508 @@
-//! The main crate for the map editor.
+//! The map editor proper, with a GUI and everything.
+#![cfg_attr(not(debug_assertions), windows_subsystem="windows")]
+#![allow(dead_code)]  // TODO: remove when this is not a huge WIP
 
-#[macro_use] extern crate qt_extras as qt;
-#[macro_use] extern crate glium;
+extern crate glutin;
+#[macro_use] extern crate gfx;
+extern crate gfx_window_glutin;
+extern crate gfx_device_gl;
+#[macro_use] extern crate imgui;
+extern crate imgui_gfx_renderer;
+extern crate lodepng;
+extern crate ndarray;
+extern crate nfd;
+extern crate divrem;
 #[macro_use] extern crate serde_derive;
 extern crate serde;
 extern crate toml;
+extern crate petgraph;
+extern crate gfx_gl as gl;
+extern crate weak_table;
+extern crate slice_of_array;
 
 extern crate dreammaker as dm;
 extern crate dmm_tools;
-extern crate same_file;
 
+mod support;
+mod dmi;
+mod map_repr;
 mod map_renderer;
+mod tasks;
+mod tools;
 mod config;
+mod history;
 
-use std::cell::RefCell;
 use std::path::{Path, PathBuf};
+use std::sync::{mpsc, Arc};
+use std::borrow::Cow;
 
-use qt::widgets;
-use qt::widgets::widget::Widget;
-use qt::widgets::application::Application;
-use qt::widgets::file_dialog::FileDialog;
-use qt::widgets::tree_widget_item::TreeWidgetItem;
-use qt::gui::key_sequence::KeySequence;
-use qt::core::connection::Signal;
-use qt::core::slots::SlotNoArgs;
-use qt::core::flags::Flags;
-use qt::cpp_utils::StaticCast;
-use qt::cpp_utils::static_cast_mut;
-
-use same_file::is_same_file;
+use imgui::*;
 
 use dm::objtree::{ObjectTree, TypeRef};
-use config::Config;
+use dmm_tools::dmm::{Map, Prefab};
 
-// ----------------------------------------------------------------------------
-// State layout
+use glutin::VirtualKeyCode as Key;
+use gfx_device_gl::{Factory, Resources, CommandBuffer};
+type Encoder = gfx::Encoder<Resources, CommandBuffer>;
+type ColorFormat = gfx::format::Rgba8;
+type DepthFormat = gfx::format::DepthStencil;
+type RenderTargetView = gfx::handle::RenderTargetView<Resources, ColorFormat>;
+type DepthStencilView = gfx::handle::DepthStencilView<Resources, DepthFormat>;
+type Texture = gfx::handle::ShaderResourceView<Resources, [f32; 4]>;
+type ImRenderer = imgui_gfx_renderer::Renderer<Resources>;
 
-#[derive(Debug)]
-struct State {
-    widgets: EditorWindow,
-    config: Config,
-    env: Option<Environment>,
-    maps: Vec<Map>,
-    current_map: usize,
-}
+use dmi::IconCache;
+type History = history::History<map_repr::AtomMap, Environment>;
 
-#[derive(Debug)]
-struct Environment {
-    dme: PathBuf,
-    root: PathBuf,
-    objtree: dm::objtree::ObjectTree,
-}
+const RED_TEXT: &[(ImGuiCol, [f32; 4])] = &[(ImGuiCol::Text, [1.0, 0.25, 0.25, 1.0])];
+const GREEN_TEXT: &[(ImGuiCol, [f32; 4])] = &[(ImGuiCol::Text, [0.25, 1.0, 0.25, 1.0])];
 
-#[derive(Debug)]
-struct Map {
-    path: PathBuf,
-    dmm: dmm_tools::dmm::Map,
-}
-
-macro_rules! widget_defs {
-    ($name:ident { $($field:ident: $typ:ty,)* }) => {
-        #[derive(Debug)]
-        struct $name {
-            $($field: *mut $typ,)*
-        }
-
-        impl Default for $name {
-            fn default() -> Self {
-                $name {
-                    $($field: 0 as *mut $typ,)*
-                }
-            }
-        }
-
-        impl $name {
-            $(unsafe fn $field(&self) -> &mut $typ {
-                &mut *self.$field
-            })*
-        }
-    }
-}
-
-widget_defs! { EditorWindow {
-    window: widgets::main_window::MainWindow,
-    status_bar: widgets::status_bar::StatusBar,
-
-    menu_file: widgets::menu::Menu,
-    menu_recent: widgets::menu::Menu,
-
-    tree: widgets::tree_widget::TreeWidget,
-    map_tabs: widgets::tab_bar::TabBar,
-}}
-
-macro_rules! action {
-    (@[$it:ident] (tip = $text:expr)) => {
-        $it.set_status_tip(&qstr!($text));
-    };
-    (@[$it:ident] (key = $(^$m:ident)* $k:ident)) => {
-        $it.set_shortcut(&KeySequence::new( qt::core::qt::Key::$k as i32 $(+ qt::core::qt::Modifier::$m as i32)* ));
-    };
-    (@[$it:ident] (slot = $slot:expr)) => {
-        $it.signals().triggered().connect(&$slot);
-    };
-    (@[$it:ident] (disabled)) => {
-        $it.set_disabled(true);
-    };
-    (@[$it:ident] $closure:block) => {
-        let slot = SlotNoArgs::new(|| $closure);
-        $it.signals().triggered().connect(&slot);
-    };
-    ($add_to:expr, $name:expr $(, $x:tt)*) => {
-        let _it = &mut *$add_to.add_action(qstr!($name));
-        $(action!(@[_it] $x);)*
-    }
-}
-
-// ----------------------------------------------------------------------------
-// Main window layout and core signals/slots
-
-#[allow(unused_mut)]
 fn main() {
-    // This RefCell is only a minor layer of safety in a wildly unsafe setup
-    let mut state_cell = RefCell::new(State::new());
-    macro_rules! state {
-        () => {&mut *state_cell.borrow_mut()}
+    support::run("SpacemanDMM".to_owned(), [0.25, 0.25, 0.5, 1.0]);
+}
+
+// ---------------------------------------------------------------------------
+// Data structures
+
+pub struct EditorScene {
+    factory: Factory,
+    target: RenderTargetView,
+    depth: DepthStencilView,
+
+    config: config::Config,
+    map_renderer: map_renderer::MapRenderer,
+    environment: Option<Environment>,
+    loading_env: Option<LoadingEnvironment>,
+
+    tools: Vec<tools::Tool>,
+    tool_current: usize,
+
+    maps: Vec<EditorMap>,
+    map_current: usize,
+    new_map: Option<NewMap>,
+
+    last_mouse_pos: (i32, i32),
+    target_tile: Option<(u32, u32)>,
+    context_tile: Option<(u32, u32)>,
+
+    errors: Vec<String>,
+    last_errors: usize,
+    counter: usize,
+    uid: usize,
+
+    ui_lock_windows: bool,
+    ui_style_editor: bool,
+    ui_imgui_metrics: bool,
+    ui_debug_mode: bool,
+    ui_debug_window: bool,
+    ui_errors: bool,
+    ui_extra_vars: bool,
+    stacked_rendering: bool,
+    stacked_inverted: bool,
+
+    mouse_drag_pos: Option<(i32, i32)>
+}
+
+pub struct Environment {
+    path: PathBuf,
+    objtree: Arc<ObjectTree>,
+    icons: Arc<IconCache>,
+    turf: String,
+    area: String,
+}
+
+struct LoadingEnvironment {
+    path: PathBuf,
+    rx: mpsc::Receiver<Result<Environment, tasks::Err>>,
+}
+
+struct EditorMap {
+    path: Option<PathBuf>,
+    z_current: usize,
+    center: [f32; 2],
+    state: MapState,
+    rendered: Vec<Option<map_renderer::RenderedMap>>,
+    edit_atoms: Vec<EditInstance>,
+    uid: usize,
+}
+
+enum MapState {
+    Invalid,
+    Loading(mpsc::Receiver<Map>),
+    Pending(Arc<Map>),
+    Preparing(Arc<Map>, mpsc::Receiver<map_repr::AtomMap>),
+    Refreshing {
+        merge_base: Arc<Map>,
+        hist: History,
+        rx: mpsc::Receiver<map_repr::AtomMap>,
+    },
+    Active {
+        merge_base: Arc<Map>,
+        hist: History,
+    },
+}
+
+struct NewMap {
+    x: i32,
+    y: i32,
+    z: i32,
+    created: bool,
+}
+
+struct EditInstance {
+    inst: map_repr::InstanceId,
+    base: EditPrefab,
+}
+
+struct EditPrefab {
+    filter: ImString,
+    fab: Prefab,
+}
+
+// ---------------------------------------------------------------------------
+// Editor scene, including rendering and UI
+
+impl EditorScene {
+    fn new(factory: &mut Factory, target: &RenderTargetView, depth: &DepthStencilView) -> Self {
+        let mut ed = EditorScene {
+            factory: factory.clone(),
+            target: target.clone(),
+            depth: depth.clone(),
+
+            config: config::Config::load(),
+            map_renderer: map_renderer::MapRenderer::new(factory, target),
+            environment: None,
+            loading_env: None,
+
+            tools: tools::configure(&ObjectTree::default()),
+            tool_current: 0,
+
+            maps: Vec::new(),
+            map_current: 0,
+            new_map: None,
+
+            last_mouse_pos: (0, 0),
+            target_tile: None,
+            context_tile: None,
+
+            errors: Vec::new(),
+            last_errors: 0,
+            counter: 0,
+            uid: 0,
+
+            ui_lock_windows: true,
+            ui_style_editor: false,
+            ui_imgui_metrics: false,
+            ui_debug_mode: cfg!(debug_assertions),
+            ui_debug_window: true,
+            ui_errors: false,
+            ui_extra_vars: false,
+            stacked_rendering: false,
+            stacked_inverted: false,
+            mouse_drag_pos: None,
+        };
+        ed.finish_init();
+        ed
     }
 
-    // Initialize the GUI
-    Application::create_and_exit(|_app| unsafe {
-        let mut state = state_cell.borrow_mut(); // because we need to drop it
-
-        let mut window = widgets::main_window::MainWindow::new();
-        state.widgets.window = window.as_mut_ptr();
-
-        // object tree
-        let mut tree_widget = widgets::tree_widget::TreeWidget::new();
-        state.widgets.tree = tree_widget.as_mut_ptr();
-        tree_widget.set_column_count(1);
-        tree_widget.set_header_hidden(true);
-
-        // map tabs
-        let mut map_tabs = qt::widgets::tab_bar::TabBar::new();
-        state.widgets.map_tabs = map_tabs.as_mut_ptr();
-        map_tabs.set_tabs_closable(true);
-        map_tabs.set_expanding(false);
-        map_tabs.set_document_mode(true);
-        let tab_close_slot = qt::core::slots::SlotCInt::new(|idx| {
-            let state = state!();
-            state.close_map(idx as usize);
-        });
-        map_tabs.signals().tab_close_requested().connect(&tab_close_slot);
-        let tab_select_slot = qt::core::slots::SlotCInt::new(|idx| {
-            // might be called by adding a new tab, just do nothing
-            if let Ok(mut state) = state_cell.try_borrow_mut() {
-                state.current_map = idx as usize;
-                state.update_current_map();
-            }
-        });
-        map_tabs.signals().current_changed().connect(&tab_select_slot);
-
-        // minimap
-        let mut minimap_widget = qt::glium_widget::create(map_renderer::GliumTest);
-        minimap_widget.set_minimum_size((256, 256));
-        minimap_widget.set_maximum_size((256, 256));
-
-        // tools
-        let mut tools = widgets::label::Label::new(qstr!("Tools Go Here"));
-
-        // instances
-        let mut list_view = widgets::list_view::ListView::new();
-
-        // map
-        let mut map_widget = qt::glium_widget::create(map_renderer::GliumTest);
-
-        // the layouts
-        let mut tools_layout = widgets::v_box_layout::VBoxLayout::new();
-        tools_layout.add_widget(qt_own!(minimap_widget));
-        tools_layout.add_widget(qt_own!(tools));
-        tools_layout.add_widget(qt_own!(list_view));
-
-        let mut h_layout = widgets::h_box_layout::HBoxLayout::new();
-        h_layout.set_spacing(5);
-        h_layout.add_layout(qt_own!(tools_layout));
-        h_layout.add_widget((qt_own!(map_widget), 1));
-        h_layout.set_contents_margins((0, 0, 0, 0));
-
-        let mut tabbed_layout = widgets::v_box_layout::VBoxLayout::new();
-        tabbed_layout.set_spacing(0);
-        tabbed_layout.add_widget(qt_own!(map_tabs));
-        tabbed_layout.add_layout((qt_own!(h_layout), 1));
-        tabbed_layout.set_contents_margins((0, 0, 0, 0));
-
-        let mut h_layout_widget = widgets::widget::Widget::new();
-        h_layout_widget.set_layout(qt_own!(tabbed_layout));
-
-        // root splitter
-        let mut splitter = widgets::splitter::Splitter::new(());
-        splitter.set_children_collapsible(false);
-        splitter.add_widget(qt_own!(tree_widget));
-        splitter.add_widget(qt_own!(h_layout_widget));
-        splitter.set_stretch_factor(0, 0);
-        splitter.set_stretch_factor(1, 1);
-
-        // menus
-        let mut menu_bar = widgets::menu_bar::MenuBar::new();
-        // file menu
-        let mut menu_file = &mut *menu_bar.add_menu(qstr!("File"));
-        state.widgets.menu_file = menu_file;
-        action!(menu_file, "New", (key = ^CTRL KeyN), (tip = "Create a new map."), (disabled), {
-            state!().new_map();
-        });
-        action!(menu_file, "Open", (key = ^CTRL KeyO), (disabled), (tip = "Open a map."), {
-            let state = state!();
-            let file = FileDialog::get_open_file_name_unsafe((
-                static_cast_mut(state.widgets.window()),
-                qstr!("Open Map"),
-                qstr!(match state.env.as_ref() {
-                    Some(env) => env.root.display().to_string(),
-                    None => return,  // no environment, shouldn't be opening maps
-                }),
-                qstr!("Maps (*.dmm)"),
-            )).to_std_string();
-            if !file.is_empty() {
-                state.load_map(PathBuf::from(file));
-            }
-        });
-        action!(menu_file, "Close", (key = ^CTRL KeyW), (disabled), (tip = "Close the current map."), {
-            let state = state!();
-            let map = state.current_map;
-            state.close_map(map);
-        });
-        menu_file.add_separator();
-        action!(menu_file, "Open Environment", (tip = "Load a DME file."), {
-            let state = state!();
-            let file = FileDialog::get_open_file_name_unsafe((
-                static_cast_mut(state.widgets.window()),
-                qstr!("Open Environment"),
-                qstr!("."),
-                qstr!("Environments (*.dme)"),
-            )).to_std_string();
-            if !file.is_empty() {
-                state.load_env(PathBuf::from(file));
-            }
-        });
-        state.widgets.menu_recent = menu_file.add_menu(qstr!("Recent Environments"));
-        menu_file.add_separator();
-        action!(menu_file, "Exit", (key = ^ALT KeyF4), (slot = window.slots().close()));
-
-        // help menu
-        let mut menu_help = &mut *menu_bar.add_menu(qstr!("Help"));
-        action!(menu_help, "User Guide", (key = KeyF1));
-        action!(menu_help, "About", {
-            use qt::widgets::message_box::*;
-            let mut mbox = MessageBox::new((
-                Icon::Information,
-                qstr!("About SpacemanDMM"),
-                qstr!(concat!(
-                    "SpacemanDMM v", env!("CARGO_PKG_VERSION"), "\n",
-                    "by SpaceManiac, for /tg/station13",
-                )),
-                Flags::from_enum(StandardButton::Ok),
-            ));
-            {
-                let widget: &mut Widget = mbox.static_cast_mut();
-                widget.set_attribute(qt::core::qt::WidgetAttribute::DeleteOnClose);
-            }
-            mbox.show();
-            mbox.into_raw();
-        });
-
-        // status bar
-        let mut status_bar = widgets::status_bar::StatusBar::new();
-        state.widgets.status_bar = status_bar.as_mut_ptr();
-
-        // build main window
-        window.set_window_title(qstr!("SpacemanDMM"));
-        window.resize((1400, 768));
-
-        window.set_menu_bar(qt_own!(menu_bar));
-        window.set_status_bar(qt_own!(status_bar));
-        window.set_central_widget(qt_own!(splitter));
-        window.show();
-
+    fn finish_init(&mut self) {
         // parse command-line arguments:
         // - use the specified DME, or autodetect one from the first DMM
         // - preload all maps specified belonging to that DME
-        let mut preload_maps = Vec::new();
+        let mut loading_env = false;
         for arg in std::env::args_os() {
             let path = PathBuf::from(arg);
 
             if path.extension() == Some("dme".as_ref()) {
-                if state.env.is_some() {
-                    // only one DME may be specified
-                    continue;
+                // only one DME may be specified
+                if !loading_env {
+                    self.load_environment(path);
+                    loading_env = true;
                 }
-                state.load_env(path);
             } else if path.extension() == Some("dmm".as_ref()) {
                 // determine the corresponding DME
-                let detected_env = match detect_environment(&path) {
-                    Some(env) => env,
-                    None => continue,
-                };
-
-                if let Some(env) = state.env.as_ref() {
-                    if !is_same_file(&env.dme, detected_env).unwrap_or(false) {
-                        preload_maps.push(path);
+                if !loading_env {
+                    if let Some(env) = detect_environment(&path) {
+                        self.load_environment(env);
+                        loading_env = true;
                     }
-                    continue;
                 }
 
-                state.load_env(detected_env);
-                preload_maps.push(path);
-            } else {
-                continue;
+                self.load_map(path);
             }
         }
 
-        for map in preload_maps {
-            state.load_map(map);
-        }
-
-        // cede control
-        state.finish_init();
-        drop(state);  // release the RefCell
-        Application::exec()
-    })
-}
-
-// ----------------------------------------------------------------------------
-// Main window state handling
-
-impl State {
-    fn new() -> State {
-        State {
-            widgets: Default::default(),
-            config: Config::load(),
-            env: None,
-            maps: Vec::new(),
-            current_map: 0,
-        }
-    }
-
-    unsafe fn finish_init(&mut self) {
-        if self.env.is_none() {
+        // Open most recent `.dme` by default.
+        if !loading_env {
             if let Some(env_path) = self.config.recent.first().cloned() {
-                self.load_env(env_path);
+                self.load_environment(env_path);
             }
-        }
-        self.update_recent();
-    }
-
-    unsafe fn update_recent(&mut self) {
-        let menu = self.widgets.menu_recent();
-        menu.clear();
-        if self.config.recent.is_empty() {
-            action!(menu, "No recent environments", (disabled));
-            return;
-        }
-
-        for (i, path) in self.config.recent.iter().enumerate() {
-            action!(menu, path.display().to_string());
         }
     }
 
-    unsafe fn load_env(&mut self, path: PathBuf) {
-        let self_ptr: *mut Self = self;
+    fn update_render_target(&mut self, target: &RenderTargetView, depth: &DepthStencilView) {
+        self.target = target.clone();
+        self.depth = depth.clone();
+    }
 
-        // show the messages and lock the interface
-        println!("Environment: {}", path.display());
-        self.widgets.status_bar().show_message(qstr!("Loading environment, please wait..."));
-        self.widgets.tree().set_disabled(true);
-        {
-            // disable the actions except for exit
-            let actions = self.widgets.menu_file().actions();
-            for i in 0..(actions.count() - 1) {
-                (**actions.at(i)).set_disabled(true);
+    fn finish_loading_env(&mut self, environment: Environment) {
+        self.config.make_recent(&environment.path);
+        self.config.save();
+        self.tools = tools::configure(&environment.objtree);
+        self.map_renderer.icons = environment.icons.clone();
+        self.map_renderer.icon_textures.clear();
+        for map in self.maps.iter_mut() {
+            for z in map.rendered.iter_mut() {
+                *z = None;
             }
-        }
-
-        let path2 = path.clone();
-        qt::future::spawn(move || -> Result<ObjectTree, String> {
-            let mut preprocessor;
-            match dm::preprocessor::Preprocessor::new(path2.clone()) {
-                Err(_) => {
-                    return Err(format!("Could not open for reading:\n{}", path2.display()));
-                },
-                Ok(pp) => preprocessor = pp,
-            }
-
-            dm::parser::parse(dm::indents::IndentProcessor::new(&mut preprocessor)).map_err(|e| {
-                let mut message = format!("\
-                    Could not parse the environment:\n\
-                    {}\n\n\
-                    This may be caused by incorrect or unusual code, but is typically a parser bug. \
-                    Change the code to use a more common form, or report the parsing problem.\n\
-                ", path2.display());
-                let mut message_buf = Vec::new();
-                let _ = dm::pretty_print_error(&mut message_buf, &preprocessor, &e);
-                message.push_str(&String::from_utf8_lossy(&message_buf[..]));
-                message
-            })
-        }, move |result| {
-            let this = &mut *self_ptr;
-            match result {
-                Ok(objtree) => {
-                    // fill the object tree
-                    {
-                        let widget = this.widgets.tree();
-                        widget.clear();
-                        let root = objtree.root();
-                        for &root_child in ["area", "turf", "obj", "mob"].iter() {
-                            let ty = root.child(root_child, &objtree).expect("builtins missing");
-
-                            let mut root_item = TreeWidgetItem::new(());
-                            root_item.set_text(0, qstr!(&ty.name));
-                            add_children(&mut root_item, ty, &objtree);
-                            widget.add_top_level_item(qt_own!(root_item));
-                        }
-                    }
-                    this.config.make_recent(&path);
-                    this.update_recent();
-                    this.config.save();
-
-                    this.env = Some(Environment {
-                        root: path.parent().unwrap().to_owned(),
-                        dme: path,
-                        objtree: objtree,
+            // need to re-render maps if the environment has changed
+            map.state = match std::mem::replace(&mut map.state, MapState::Invalid) {
+                MapState::Pending(base) |
+                MapState::Preparing(base, _) => {
+                    let (tx, rx) = mpsc::channel();
+                    let icons = environment.icons.clone();
+                    let objtree = environment.objtree.clone();
+                    let base2 = base.clone();
+                    std::thread::spawn(move || {
+                        let _ = tx.send(map_repr::AtomMap::new(&base2, &icons, &objtree));
                     });
-                }
-                Err(message) => {
-                    show_error(this.widgets.window(), &message);
-                }
-            }
-
-            // un-disable everything
-            this.widgets.status_bar().clear_message();
-            this.widgets.tree().set_disabled(false);
-            let actions = this.widgets.menu_file().actions();
-            for i in 0..actions.count() {
-                (**actions.at(i)).set_disabled(false);
-            }
-        });
+                    MapState::Preparing(base, rx)
+                },
+                MapState::Active { merge_base, hist } => {
+                    let mut new_map = hist.current().clone();
+                    let icons = environment.icons.clone();
+                    let objtree = environment.objtree.clone();
+                    let (tx, rx) = mpsc::channel();
+                    std::thread::spawn(move || {
+                        new_map.refresh_pops(&icons, &objtree);
+                        let _ = tx.send(new_map);
+                    });
+                    MapState::Refreshing { merge_base, hist, rx }
+                },
+                other => other,
+            };
+        }
+        self.environment = Some(environment);
     }
 
-    unsafe fn new_map(&mut self) {
-        // self.widgets.map_tabs().add_tab(qstr!("New Map"));
-    }
-
-    unsafe fn load_map(&mut self, path: PathBuf) {
-        println!("Map: {}", path.display());
-
-        // Verify that we're in the right environment
-        let detected = detect_environment(&path);
-        match (detected, self.env.as_ref()) {
-            (Some(detected), Some(env)) => if !is_same_file(detected, &env.dme).unwrap_or(false) {
-                return show_error(self.widgets.window(), "The map belongs to a different environment.");
-            },
-            (None, Some(_)) => if !ask_warning(self.widgets.window(), "The map has no environment.\nWould you like to load it anyways?") {
-                return
+    fn render(&mut self, encoder: &mut Encoder) {
+        if let Some(loading) = self.loading_env.take() {
+            match loading.rx.try_recv() {
+                Ok(Ok(env)) => self.finish_loading_env(env),
+                Ok(Err(e)) => {
+                    self.errors.push(format!("Error(s) loading environment: {}", e));
+                }
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    self.errors.push("BUG: environment loading crashed".to_owned());
+                }
+                Err(mpsc::TryRecvError::Empty) => {
+                    self.loading_env = Some(loading);
+                }
             }
-            _ => return,  // Shouldn't happen
         }
 
-        let map = match dmm_tools::dmm::Map::from_file(&path) {
-            Err(e) => {
-                let message = format!("Could not load the map:\n{}\n\n{}", path.display(), e.description());
-                return show_error(self.widgets.window(), &message);
+        // TODO: error handling
+        for map in self.maps.iter_mut() {
+            map.state = match std::mem::replace(&mut map.state, MapState::Invalid) {
+                MapState::Loading(rx) => if let Ok(val) = rx.try_recv() {
+                    MapState::Pending(Arc::new(val))
+                } else {
+                    MapState::Loading(rx)
+                },
+                MapState::Pending(base) => if let Some(env) = self.environment.as_ref() {
+                    let (tx, rx) = mpsc::channel();
+                    let icons = env.icons.clone();
+                    let objtree = env.objtree.clone();
+                    let base2 = base.clone();
+                    std::thread::spawn(move || {
+                        let _ = tx.send(map_repr::AtomMap::new(&base2, &icons, &objtree));
+                    });
+                    MapState::Preparing(base, rx)
+                } else {
+                    MapState::Pending(base)
+                },
+                MapState::Preparing(merge_base, rx) => if let Ok(val) = rx.try_recv() {
+                    let (x, y, z) = val.dim_xyz();
+                    map.center = [x as f32 * 16.0, y as f32 * 16.0];
+                    map.rendered.clear();
+                    for _ in 0..z {
+                        map.rendered.push(None);
+                    }
+                    MapState::Active {
+                        merge_base,
+                        hist: History::new("Loaded".to_owned(), val),
+                    }
+                } else {
+                    MapState::Preparing(merge_base, rx)
+                },
+                MapState::Refreshing {
+                    merge_base,
+                    mut hist,
+                    rx,
+                } => if let Ok(val) = rx.try_recv() {
+                    hist.replace_current(val);
+                    MapState::Active { merge_base, hist }
+                } else {
+                    MapState::Refreshing { merge_base, hist, rx }
+                },
+                other => other,
+            };
+        }
+
+        if let Some(map) = self.maps.get_mut(self.map_current) {
+            if let Some(hist) = map.state.hist() {
+                let map_renderer = &mut self.map_renderer;
+                let factory = &mut self.factory;
+                let mut levels = Vec::new();
+                if !self.stacked_rendering {  // normal rendering
+                    levels.push(map.z_current);
+                } else if !self.stacked_inverted {  // stacked rendering
+                    levels.extend((map.z_current..map.rendered.len()).rev());
+                } else {  // inverted stacked rendering
+                    levels.extend(0..=map.z_current);
+                }
+
+                for z in levels {
+                    if let Some(rendered) = map.rendered.get_mut(z) {
+                        rendered.fulfill(|| {
+                            map_renderer.render(
+                                hist.current(),
+                                z as u32,
+                            )
+                        }).paint(
+                            map_renderer,
+                            hist.current(),
+                            z as u32,
+                            map.center,
+                            factory,
+                            encoder,
+                            &self.target,
+                        );
+                    }
+                }
             }
-            Ok(map) => map,
+        }
+    }
+
+    fn run_ui(&mut self, ui: &Ui, renderer: &mut ImRenderer) -> bool {
+        for tool in self.tools.iter_mut() {
+            tool.icon.prepare(
+                self.environment.as_ref(),
+                &mut tools::IconCtx::new(renderer, &mut self.map_renderer),
+            );
+        }
+
+        #[cfg(not(target_os = "macos"))]
+        macro_rules! ctrl_shortcut {
+            ($rest:expr) => {
+                im_str!("Ctrl+{}", $rest)
+            };
+        }
+        #[cfg(target_os = "macos")]
+        macro_rules! ctrl_shortcut {
+            ($rest:expr) => {
+                im_str!("Cmd+{}", $rest)
+            };
+        }
+
+        let mut continue_running = true;
+        let mut window_positions_cond = match self.ui_lock_windows {
+            false => ImGuiCond::FirstUseEver,
+            true => ImGuiCond::Always,
         };
 
-        match path.file_name() {
-            None => return show_error(self.widgets.window(), "Weird: no filename?"),
-            Some(file_name) => { self.widgets.map_tabs().add_tab(qstr!(file_name.to_string_lossy())); }
-        }
+        ui.main_menu_bar(|| {
+            ui.menu(im_str!("File")).build(|| {
+                let some_map = self.maps.get(self.map_current).is_some();
+                if ui.menu_item(im_str!("Open environment"))
+                    .shortcut(ctrl_shortcut!("Shift+O"))
+                    .build() { self.open_environment(); }
+                ui.menu(im_str!("Recent environments")).enabled(!self.config.recent.is_empty()).build(|| {
+                    let mut clicked = None;
+                    for (i, path) in self.config.recent.iter().enumerate() {
+                        if ui.menu_item(im_str!("{}", path.display()))
+                            .shortcut(im_str!("{}", i + 1))
+                            .build()
+                        {
+                            clicked = Some(path.to_owned());
+                        }
+                    }
+                    if let Some(clicked) = clicked {
+                        self.load_environment(clicked);
+                    }
+                });
+                if ui.menu_item(im_str!("Update environment"))
+                    .shortcut(ctrl_shortcut!("U"))
+                    .enabled(self.environment.is_some())
+                    .build() { self.reload_objtree(); }
+                ui.separator();
+                if ui.menu_item(im_str!("New"))
+                    .shortcut(ctrl_shortcut!("N"))
+                    .build() { self.new_map(); }
+                if ui.menu_item(im_str!("Open"))
+                    .shortcut(ctrl_shortcut!("O"))
+                    .build() { self.open_map(); }
+                if ui.menu_item(im_str!("Close"))
+                    .shortcut(ctrl_shortcut!("W"))
+                    .enabled(some_map)
+                    .build() { self.close_map(); }
+                ui.separator();
+                if ui.menu_item(im_str!("Save"))
+                    .shortcut(ctrl_shortcut!("S"))
+                    .enabled(some_map)
+                    .build() { self.save_map(); }
+                if ui.menu_item(im_str!("Save As"))
+                    .shortcut(ctrl_shortcut!("Shift+S"))
+                    .enabled(some_map)
+                    .build() { self.save_map_as(false); }
+                if ui.menu_item(im_str!("Save Copy As"))
+                    .enabled(some_map)
+                    .build() { self.save_map_as(true); }
+                if ui.menu_item(im_str!("Save All"))
+                    .enabled(!self.maps.is_empty())
+                    .build() { self.save_all(); }
+                ui.separator();
+                if ui.menu_item(im_str!("Exit"))
+                    .shortcut(im_str!("Alt+F4"))
+                    .build()
+                {
+                    continue_running = false;
+                }
+            });
+            let (mut can_undo, mut can_redo) = (false, false);
+            if let Some(map) = self.maps.get(self.map_current) {
+                if let Some(hist) = map.state.hist() {
+                    can_undo = hist.can_undo();
+                    can_redo = hist.can_redo();
+                }
+            }
+            ui.menu(im_str!("Edit")).build(|| {
+                if ui.menu_item(im_str!("Undo"))
+                    .shortcut(ctrl_shortcut!("Z"))
+                    .enabled(can_undo)
+                    .build() { self.undo(); }
+                if ui.menu_item(im_str!("Redo"))
+                    .shortcut(ctrl_shortcut!("Shift+Z"))
+                    .enabled(can_redo)
+                    .build() { self.redo(); }
+                ui.separator();
+                ui.menu_item(im_str!("Cut"))
+                    .shortcut(ctrl_shortcut!("X"))
+                    .enabled(false)
+                    .build();
+                ui.menu_item(im_str!("Copy"))
+                    .shortcut(ctrl_shortcut!("C"))
+                    .enabled(false)
+                    .build();
+                ui.menu_item(im_str!("Paste"))
+                    .shortcut(ctrl_shortcut!("V"))
+                    .enabled(false)
+                    .build();
+                ui.menu_item(im_str!("Delete"))
+                    .shortcut(im_str!("Del"))
+                    .enabled(false)
+                    .build();
+                ui.separator();
+                ui.menu_item(im_str!("Select All"))
+                    .shortcut(ctrl_shortcut!("A"))
+                    .enabled(false)
+                    .build();
+                ui.menu_item(im_str!("Select None"))
+                    .shortcut(ctrl_shortcut!("Shift+A"))
+                    .enabled(false)
+                    .build();
+            });
+            ui.menu(im_str!("Options")).build(|| {
+                ui.menu_item(im_str!("Frame areas"))
+                    .enabled(false)
+                    .build();
+                ui.menu_item(im_str!("Show extra variables"))
+                    .selected(&mut self.ui_extra_vars)
+                    .build();
+                ui.separator();
+                ui.menu_item(im_str!("Stacked rendering"))
+                    .selected(&mut self.stacked_rendering)
+                    .build();
+                ui.menu_item(im_str!("Invert order"))
+                    .selected(&mut self.stacked_inverted)
+                    .build();
+                ui.separator();
+                for &zoom in [0.5, 1.0, 2.0, 4.0].iter() {
+                    let mut selected = self.map_renderer.zoom == zoom;
+                    if ui.menu_item(im_str!("{}%", 100.0 * zoom)).selected(&mut selected).build() {
+                        self.map_renderer.zoom = zoom;
+                    }
+                }
+            });
+            ui.menu(im_str!("Layers")).build(|| {
+                ui.menu_item(im_str!("Customize filters..."))
+                    .enabled(false)
+                    .build();
+                ui.separator();
+                ui.menu_item(im_str!("Area"))
+                    .shortcut(ctrl_shortcut!("1"))
+                    .selected(&mut self.map_renderer.layers[1])
+                    .build();
+                ui.menu_item(im_str!("Turf"))
+                    .shortcut(ctrl_shortcut!("2"))
+                    .selected(&mut self.map_renderer.layers[2])
+                    .build();
+                ui.menu_item(im_str!("Obj"))
+                    .shortcut(ctrl_shortcut!("3"))
+                    .selected(&mut self.map_renderer.layers[3])
+                    .build();
+                ui.menu_item(im_str!("Mob"))
+                    .shortcut(ctrl_shortcut!("4"))
+                    .selected(&mut self.map_renderer.layers[4])
+                    .build();
+            });
+            ui.menu(im_str!("Window")).build(|| {
+                ui.menu_item(im_str!("Lock positions"))
+                    .selected(&mut self.ui_lock_windows)
+                    .build();
+                if ui.menu_item(im_str!("Reset positions")).enabled(!self.ui_lock_windows).build() {
+                    window_positions_cond = ImGuiCond::Always;
+                }
+                ui.separator();
+                ui.menu_item(im_str!("Errors"))
+                    .selected(&mut self.ui_errors)
+                    .build();
+            });
+            if self.ui_debug_mode {
+                ui.menu(im_str!("Debug")).build(|| {
+                    ui.menu_item(im_str!("Debug Window"))
+                        .selected(&mut self.ui_debug_window)
+                        .build();
+                    ui.menu_item(im_str!("Style Editor"))
+                        .selected(&mut self.ui_style_editor)
+                        .build();
+                    ui.menu_item(im_str!("ImGui Metrics"))
+                        .selected(&mut self.ui_imgui_metrics)
+                        .build();
+                });
+            }
+            ui.menu(im_str!("Help")).build(|| {
+                ui.menu_item(im_str!("About SpacemanDMM"))
+                    .enabled(false)
+                    .build();
+                ui.menu_item(im_str!("Open-source licenses"))
+                    .enabled(false)
+                    .build();
+                ui.menu(im_str!("ImGui help")).build(|| {
+                    ui.show_user_guide();
+                });
+            });
 
-        self.current_map = self.maps.len();
-        self.widgets.map_tabs().set_current_index(self.current_map as i32);
-        self.maps.push(Map {
-            path: path,
-            dmm: map,
+            const SPINNER: &[&str] = &["|", "/", "-", "\\"];
+            self.counter = self.counter.wrapping_add(1);
+            let mut i = 0;
+            macro_rules! spinner {
+                () => {
+                    SPINNER[(self.counter / 10 + {
+                        i += 1;
+                        i
+                    }) % SPINNER.len()]
+                };
+            }
+
+            if let Some(loading) = self.loading_env.as_ref() {
+                ui.separator();
+                ui.text(im_str!("{} Loading {}", spinner!(), file_name(&loading.path)));
+            }
+            for map in self.maps.iter() {
+                if let Some(path) = map.path.as_ref() {
+                    match map.state {
+                        MapState::Loading(..) => {
+                            ui.separator();
+                            ui.text(im_str!("{} Loading {}", spinner!(), file_name(path)));
+                        }
+                        MapState::Refreshing { .. } |
+                        MapState::Preparing(..) => {
+                            ui.separator();
+                            ui.text(im_str!("{} Preparing {}", spinner!(), file_name(path)));
+                        }
+                        _ => {}
+                    }
+                }
+            }
+
+            if self.errors.len() > self.last_errors {
+                ui.separator();
+                if ui.menu_item(im_str!("{} errors", self.errors.len() - self.last_errors)).build() {
+                    self.ui_errors = true;
+                }
+            }
         });
-        self.update_current_map();
+
+        ui.window(im_str!("Tools"))
+            .position((10.0, 30.0), window_positions_cond)
+            .movable(!self.ui_lock_windows)
+            .size((300.0, 300.0), ImGuiCond::FirstUseEver)
+            .resizable(!self.ui_lock_windows)
+            .build(|| {
+                let count = ui.fits_width(34.0);  // 32 + 2px border
+                for (i, tool) in self.tools.iter().enumerate() {
+                    if i % count != 0 {
+                        ui.same_line(0.0);
+                    }
+
+                    if ui.tool_icon(i == self.tool_current, &tool.icon, im_str!("{}", tool.name)) {
+                        self.tool_current = i;
+                    }
+                    if ui.is_item_hovered() {
+                        ui.tooltip_text(&tool.name);
+                    }
+                }
+
+                if let Some(tool) = self.tools.get_mut(self.tool_current) {
+                    ui.separator();
+                    if tool.help.is_empty() {
+                        ui.text_wrapped(im_str!("{}", tool.name));
+                    } else {
+                        ui.text_wrapped(im_str!("{} - {}", tool.name, tool.help));
+                    }
+                    if let Some(ref env) = self.environment {
+                        tool.behavior.settings(ui, env, &mut tools::IconCtx::new(renderer, &mut self.map_renderer));
+                    } else if self.loading_env.is_some() {
+                        ui.text(im_str!("The environment is loading..."));
+                    } else {
+                        ui.text(im_str!("Load an environment to get started."));
+                    }
+                }
+            });
+
+        ui.window(im_str!("Object Tree"))
+            .position((10.0, 340.0), window_positions_cond)
+            .movable(!self.ui_lock_windows)
+            .size((300.0, 400.0), ImGuiCond::FirstUseEver)
+            .build(|| {
+                if let Some(env) = self.environment.as_ref() {
+                    let root = env.objtree.root();
+                    root_node(ui, root, "area");
+                    root_node(ui, root, "turf");
+                    root_node(ui, root, "obj");
+                    root_node(ui, root, "mob");
+                } else {
+                    ui.text(im_str!("The object tree is loading..."));
+                }
+            });
+
+        let logical_size = ui.frame_size().logical_size;
+        ui.window(im_str!("Maps"))
+            .position((logical_size.0 as f32 - 230.0, 30.0), window_positions_cond)
+            .movable(!self.ui_lock_windows)
+            .size((220.0, logical_size.1 as f32 - 40.0), window_positions_cond)
+            .resizable(!self.ui_lock_windows)
+            .build(|| {
+                for (map_idx, map) in self.maps.iter_mut().enumerate() {
+                    let dirty = map.state.hist().map_or(false, |h| h.is_dirty());
+                    let title = match map.path {
+                        Some(ref path) => format!(
+                            "{}{}##map_{}",
+                            file_name(path),
+                            if dirty { " *" } else { "" },
+                            path.display()
+                        ),
+                        None => format!("Untitled##{}", map_idx),
+                    };
+                    if ui.collapsing_header(&ImString::from(title)).default_open(true).build() {
+                        if let Some(hist) = map.state.hist() {
+                            let world = hist.current();
+                            if let Some(dmm) = map.state.base_dmm() {
+                                ui.text(im_str!(
+                                    "{:?}; {}-keys: {}",
+                                    world.dim_xyz(),
+                                    dmm.key_length,
+                                    dmm.dictionary.len()
+                                ));
+                            } else {
+                                ui.text(im_str!("{:?}", world.dim_xyz()));
+                            }
+                            for z in 0..world.dim_xyz().2 {
+                                if ui.small_button(im_str!("z = {}##map_{}_{}", z + 1, map_idx, z)) {
+                                    self.map_current = map_idx;
+                                    map.z_current = z as usize;
+                                }
+                            }
+                        } else if let Some(dmm) = map.state.base_dmm() {
+                            ui.text(im_str!(
+                                "{:?}; {}-keys: {}",
+                                dmm.dim_xyz(),
+                                dmm.key_length,
+                                dmm.dictionary.len()
+                            ));
+                        }
+                    }
+                }
+            });
+
+        if !ui.want_capture_mouse() {
+            if ui.imgui().is_mouse_clicked(ImMouseButton::Left) {
+                if let Some(env) = self.environment.as_ref() {
+                    if let Some(map) = self.maps.get_mut(self.map_current) {
+                        let z = map.z_current as u32;
+                        if let Some(hist) = map.state.hist_mut() {
+                            if let Some((x, y)) = self.target_tile {
+                                if let Some(tool) = self.tools.get_mut(self.tool_current) {
+                                    tool.behavior.click(hist, env, (x, y, z));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            if ui.imgui().is_mouse_clicked(ImMouseButton::Right) {
+                if let Some(tile) = self.target_tile {
+                    self.context_tile = Some(tile);
+                    ui.open_popup(im_str!("context"));
+                }
+            }
+            
+            if ui.imgui().is_mouse_down(ImMouseButton::Middle)
+            && self.mouse_drag_pos.is_none() {
+                self.mouse_drag_pos = Some(self.last_mouse_pos);
+            }
+        }
+
+        if !ui.imgui().is_mouse_down(ImMouseButton::Middle)
+        && self.mouse_drag_pos.is_some() {
+            self.mouse_drag_pos = None;
+        }
+
+        if let Some((x, y)) = self.context_tile {
+            let mut open = false;
+            ui.popup(im_str!("context"), || {
+                open = true;
+
+                if let Some(map) = self.maps.get_mut(self.map_current) {
+                    let z = map.z_current as u32;
+                    let edit_atoms = &mut map.edit_atoms;
+                    if let Some(hist) = map.state.hist() {
+                        let current = hist.current();
+                        for (inst, fab) in current.iter_instances((x, y, z)) {
+                            let mut color_vars = RED_TEXT;
+                            if let Some(env) = self.environment.as_ref() {
+                                if env.objtree.find(&fab.path).is_some() {
+                                    color_vars = &[];
+                                }
+                            }
+
+                            ui.with_style_and_color_vars(&[], color_vars, || {
+                                if ui.menu_item(im_str!("{}", fab.path)).build() {
+                                    edit_atoms.push(EditInstance {
+                                        inst,
+                                        base: EditPrefab::new(fab.clone()),
+                                    });
+                                }
+                            });
+                        }
+                    }
+                }
+            });
+            if !open {
+                self.context_tile = None;
+            }
+        }
+
+        self.new_map = self.new_map.take().and_then(|mut new_map| {
+            let mut opened = true;
+            let mut closed = false;
+
+            ui.window(im_str!("New Map"))
+                .opened(&mut opened)
+                .resizable(false)
+                .build(|| {
+                    ui.input_int(im_str!("X"), &mut new_map.x).build();
+                    ui.input_int(im_str!("Y"), &mut new_map.y).build();
+                    ui.input_int(im_str!("Z"), &mut new_map.z).build();
+
+                    if !new_map.created {
+                        if ui.button(im_str!("New"), (80.0, 20.0)) {
+                            new_map.created = true;
+                        }
+                    } else {
+                        ui.button(im_str!("Wait..."), (80.0, 20.0));
+                    }
+                    ui.same_line(0.0);
+                    if ui.button(im_str!("Cancel"), (80.0, 20.0)) {
+                        closed = true;
+                    }
+                });
+            new_map.x = std::cmp::min(std::cmp::max(new_map.x, 1), 512);
+            new_map.y = std::cmp::min(std::cmp::max(new_map.y, 1), 512);
+            new_map.z = std::cmp::min(std::cmp::max(new_map.z, 1), 32);
+
+            if let Some(env) = self.environment.as_ref() {
+                if new_map.created {
+                    self.map_current = self.maps.len();
+                    let mut rendered = Vec::new();
+                    for _ in 0..new_map.z {
+                        rendered.push(None);
+                    }
+                    let dmm = Map::new(
+                        new_map.x as usize,
+                        new_map.y as usize,
+                        new_map.z as usize,
+                        env.turf.clone(),
+                        env.area.clone(),
+                    );
+                    let atom_map = map_repr::AtomMap::new(&dmm, &env.icons, &env.objtree);
+                    let desc = format!("New {}x{}x{} map", new_map.x, new_map.y, new_map.z);
+                    self.maps.push(EditorMap {
+                        path: None,
+                        state: MapState::Active {
+                            merge_base: Arc::new(dmm),
+                            hist: History::new(desc, atom_map),
+                        },
+                        z_current: 0,
+                        center: [new_map.x as f32 * 16.0, new_map.y as f32 * 16.0],
+                        rendered,
+                        edit_atoms: Vec::new(),
+                        uid: self.uid,
+                    });
+                    self.uid += 1;
+                    opened = false;
+                }
+            }
+            if opened && !closed {
+                Some(new_map)
+            } else {
+                None
+            }
+        });
+
+        if let Some(map) = self.maps.get_mut(self.map_current) {
+            let env = self.environment.as_ref();
+            let extra_vars = self.ui_extra_vars;
+            let uid = map.uid;
+            let mut delete = Vec::new();
+            let tools = &mut self.tools;
+            let tool_current = self.tool_current;
+            map.edit_atoms.retain_mut(|edit| {
+                let mut keep = true;
+                let mut keep2 = true;
+
+                let EditInstance {
+                    ref mut inst,
+                    ref mut base,
+                } = edit;
+                ui.window(im_str!("{}##{}/{:?}", base.fab.path, uid, inst))
+                    .opened(&mut keep)
+                    .position(ui.imgui().mouse_pos(), ImGuiCond::Appearing)
+                    .size((350.0, 500.0), ImGuiCond::FirstUseEver)
+                    .horizontal_scrollbar(true)
+                    .menu_bar(true)
+                    .build(|| {
+                        ui.menu_bar(|| {
+                            if ui.menu_item(im_str!("Apply")).build() {
+                                // TODO: actually apply
+                                keep2 = false;
+                            }
+                            ui.separator();
+                            if ui.menu_item(im_str!("Delete")).build() {
+                                keep2 = false;
+                                delete.push(inst.clone());
+                            }
+                            ui.separator();
+                            if ui.menu_item(im_str!("Pick")).build() {
+                                if let Some(tool) = tools.get_mut(tool_current) {
+                                    if let Some(env) = env {
+                                        tool.behavior.pick(&env, &base.fab);
+                                    }
+                                }
+                            }
+                            ui.separator();
+                            base.menu(ui);
+                        });
+                        base.show(ui, env, extra_vars);
+                    });
+                keep && keep2
+            });
+            if let Some(hist) = map.state.hist_mut() {
+                if let Some(env) = env {
+                    for id in delete.into_iter() {
+                        hist.edit(env, "TODO".to_owned(), move |_, world| {
+                            let removed = world.remove_instance(id.clone());
+                            Box::new(move |env, world| {
+                                world.undo_remove_instance(&removed, &env.icons, &env.objtree);
+                            })
+                        })
+                    }
+                }
+            }
+
+            // Handle mouse dragging.
+            if let Some(pos) = self.mouse_drag_pos {
+                let diff = (self.last_mouse_pos.0 - pos.0, self.last_mouse_pos.1 - pos.1);
+                map.center[0] -= diff.0 as f32 / self.map_renderer.zoom;
+                map.center[1] += diff.1 as f32 / self.map_renderer.zoom;
+                self.mouse_drag_pos = Some(self.last_mouse_pos);
+            }
+        }
+
+        if self.ui_debug_mode {
+            if self.ui_debug_window {
+                let mut opened = self.ui_debug_window;
+                ui.window(im_str!("Debug"))
+                    .position((320.0, 30.0), ImGuiCond::FirstUseEver)
+                    .always_auto_resize(true)
+                    .opened(&mut opened)
+                    .build(|| {
+                        ui.text(im_str!(
+                            "maps[{}], map = {}, zoom = {}",
+                            self.maps.len(),
+                            self.map_current,
+                            self.map_renderer.zoom
+                        ));
+                        if let Some(env) = self.environment.as_ref() {
+                            ui.text(im_str!(
+                                "types[{}], icons[{}]",
+                                env.objtree.graph.node_count(),
+                                env.icons.len()
+                            ));
+                            ui.text(im_str!("turf = {}", env.turf));
+                            ui.text(im_str!("area = {}", env.area));
+                        }
+                        if let Some(map) = self.maps.get(self.map_current) {
+                            ui.text(im_str!("center = {:?}", map.center));
+                            if let Some(hist) = map.state.hist() {
+                                let current = hist.current();
+                                if let Some(level) = current.levels.get(map.z_current) {
+                                    ui.text(im_str!(
+                                        "draw_calls[{}], pops[{}], atoms[{}]",
+                                        level.draw_calls.len(),
+                                        current.pops.len(),
+                                        level.instances.len()
+                                    ));
+                                }
+                            }
+                            if let Some(rendered) = map.rendered.get(map.z_current).and_then(|x| x.as_ref()) {
+                                ui.text(im_str!("timings: {:?}", rendered.duration));
+                            }
+                        }
+                        if let Some((x, y)) = self.target_tile {
+                            ui.text(im_str!("target: {}, {}", x, y));
+                        }
+                    });
+                self.ui_debug_window = opened;
+            }
+            if self.ui_style_editor {
+                ui.window(im_str!("Style Editor"))
+                    .opened(&mut self.ui_style_editor)
+                    .build(|| ui.show_default_style_editor());
+            }
+            if self.ui_imgui_metrics {
+                ui.show_metrics_window(&mut self.ui_imgui_metrics);
+            }
+        }
+
+        if self.ui_errors {
+            self.last_errors = self.errors.len();
+            let mut ui_errors = self.ui_errors;
+            ui.window(im_str!("Errors"))
+                .position((320.0, 140.0), ImGuiCond::FirstUseEver)
+                .size((300.0, 400.0), ImGuiCond::FirstUseEver)
+                .horizontal_scrollbar(true)
+                .opened(&mut ui_errors)
+                .build(|| {
+                    ui.text(im_str!("{:#?}", self.errors));
+                });
+            self.ui_errors = ui_errors;
+        }
+
+        continue_running
     }
 
-    unsafe fn close_map(&mut self, index: usize) {
-        if index >= self.maps.len() { return }
-        self.maps.remove(index);
-        self.widgets.map_tabs().remove_tab(index as i32);
-        self.update_current_map();
+    fn mouse_moved(&mut self, (x, y): (i32, i32)) {
+        self.last_mouse_pos = (x, y);
+        self.target_tile = self.tile_under((x, y));
     }
 
-    unsafe fn update_current_map(&mut self) {
+    fn tile_under(&self, (x, y): (i32, i32)) -> Option<(u32, u32)> {
+        if let Some(map) = self.maps.get(self.map_current) {
+            if let Some(hist) = map.state.hist() {
+                let (w, h, _, _) = self.target.get_dimensions();
+                let (cx, cy) = (w / 2, h / 2);
+                let tx = ((map.center[0].round() + (x as f32 - cx as f32) / self.map_renderer.zoom) / 32.0).floor() as i32;
+                let ty = ((map.center[1].round() + (cy as f32 - y as f32) / self.map_renderer.zoom) / 32.0).floor() as i32;
+                let (dim_x, dim_y, _) = hist.current().dim_xyz();
+                if tx >= 0 && ty >= 0 && tx < dim_x as i32 && ty < dim_y as i32 {
+                    return Some((tx as u32, ty as u32));
+                }
+            }
+        }
+        None
+    }
+
+    fn mouse_wheel(&mut self, ctrl: bool, shift: bool, alt: bool, x: f32, y: f32) {
+        if alt {
+            if y > 0.0 && self.map_renderer.zoom < 16.0 {
+                self.map_renderer.zoom *= 2.0;
+            } else if y < 0.0 && self.map_renderer.zoom > 0.0625 {
+                self.map_renderer.zoom *= 0.5;
+            }
+            self.target_tile = self.tile_under(self.last_mouse_pos);
+            return;
+        }
+        let mut mul = if ctrl { -1.0 } else { 1.0 };
+        if shift {
+            mul *= 8.0;
+        }
+
+        if let Some(map) = self.maps.get_mut(self.map_current) {
+            let scroll_y = mul * y / self.map_renderer.zoom;
+            let scroll_x = mul * x / self.map_renderer.zoom;
+            if ctrl {
+                map.center[0] += scroll_y;
+                map.center[1] += scroll_x;
+            } else {
+                map.center[1] += scroll_y;
+                map.center[0] += scroll_x;
+            }
+            map.clamp_center();
+        }
+        self.target_tile = self.tile_under(self.last_mouse_pos);
+    }
+
+    #[deny(unreachable_patterns)]
+    fn chord(&mut self, ctrl: bool, shift: bool, alt: bool, key: Key) {
+        use Key::*;
+        macro_rules! k {
+            (@[$ctrl:pat, $shift:pat, $alt:pat] $k:pat) => {
+                ($ctrl, $shift, $alt, $k)
+            };
+            (@[$ctrl:pat, $shift:pat, $alt:pat] Ctrl + $($rest:tt)*) => {
+                k!(@[true, $shift, $alt] $($rest)*)
+            };
+            (@[$ctrl:pat, $shift:pat, $alt:pat] Shift + $($rest:tt)*) => {
+                k!(@[$ctrl, true, $alt] $($rest)*)
+            };
+            (@[$ctrl:pat, $shift:pat, $alt:pat] Alt + $($rest:tt)*) => {
+                k!(@[$ctrl, $shift, true] $($rest)*)
+            };
+            (@$($rest:tt)*) => { error };
+            ($($rest:tt)*) => {
+                k!(@[false, false, false] $($rest)*)
+            };
+        }
+        match (ctrl, shift, alt, key) {
+            // File
+            k!(Ctrl + Shift + O) => self.open_environment(),
+            k!(Ctrl + U) => self.reload_objtree(),
+            k!(Ctrl + N) => self.new_map(),
+            k!(Ctrl + O) => self.open_map(),
+            k!(Ctrl + W) => self.close_map(),
+            k!(Ctrl + S) => self.save_map(),
+            k!(Ctrl + Shift + S) => self.save_map_as(false),
+            // Edit
+            k!(Ctrl + Z) => self.undo(),
+            k!(Ctrl + Shift + Z) | k!(Ctrl + Y) => self.redo(),
+            // Layers
+            k!(Ctrl + Key1) => self.toggle_layer(1),
+            k!(Ctrl + Key2) => self.toggle_layer(2),
+            k!(Ctrl + Key3) => self.toggle_layer(3),
+            k!(Ctrl + Key4) => self.toggle_layer(4),
+            // misc
+            k!(Ctrl + Equals) |
+            k!(Ctrl + Add) => if self.map_renderer.zoom < 16.0 { self.map_renderer.zoom *= 2.0 },
+            k!(Ctrl + Subtract) |
+            k!(Ctrl + Minus) => if self.map_renderer.zoom > 0.0625 { self.map_renderer.zoom *= 0.5 },
+            k!(Ctrl + Tab) => self.tab_between_maps(1),
+            k!(Ctrl + Shift + Tab) => self.tab_between_maps(-1),
+            k!(F3) => self.ui_debug_mode = !self.ui_debug_mode,
+            _ => {}
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Actions - called from run_ui() and from chord()
+
+    fn reload_objtree(&mut self) {
+        if let Some(env) = self.environment.as_ref().map(|e| &e.path).cloned() {
+            self.load_environment(env);
+        }
+    }
+
+    fn open_environment(&mut self) {
+        if let Ok(nfd::Response::Okay(fname)) = nfd::open_file_dialog(Some("dme"), None) {
+            self.load_environment(fname.into());
+        }
+    }
+
+    fn load_environment(&mut self, path: PathBuf) {
+        let path2 = path.clone();
+        let rx = tasks::spawn(move || {
+            use dm::constants::Constant;
+            use dm::ast::PathOp;
+
+            fn format_path(path: &[(PathOp, String)]) -> String {
+                let mut s = String::new();
+                for &(_, ref part) in path.iter() {
+                    s.push_str("/");
+                    s.push_str(part);
+                }
+                s
+            }
+
+            let context = dm::Context::default();
+            let objtree = context.parse_environment(&path)?;
+
+            let (mut turf, mut area) = ("/turf".to_owned(), "/area".to_owned());
+            if let Some(world) = objtree.find("/world") {
+                if let Some(turf_var) = world.get_value("turf") {
+                    if let Some(Constant::Prefab(ref prefab)) = turf_var.constant {
+                        turf = format_path(&prefab.path);
+                    }
+                }
+                if let Some(area_var) = world.get_value("area") {
+                    if let Some(Constant::Prefab(ref prefab)) = area_var.constant {
+                        area = format_path(&prefab.path);
+                    }
+                }
+            }
+
+            Ok(Environment {
+                objtree: Arc::new(objtree),
+                icons: Arc::new(IconCache::new(path.parent().expect("invalid environment file path"))),
+                turf,
+                area,
+                path,
+            })
+        });
+        self.loading_env = Some(LoadingEnvironment { path: path2, rx });
+    }
+
+    fn new_map(&mut self) {
+        self.new_map = Some(NewMap {
+            x: 32,
+            y: 32,
+            z: 1,
+            created: false,
+        });
+    }
+
+    fn open_map(&mut self) {
+        match nfd::open_file_multiple_dialog(Some("dmm"), None) {
+            Ok(nfd::Response::Okay(fname)) => {
+                self.load_map(fname.into());
+            }
+            Ok(nfd::Response::OkayMultiple(fnames)) => {
+                for each in fnames {
+                    self.load_map(each.into());
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn load_map(&mut self, path: PathBuf) {
+        for (i, map) in self.maps.iter().enumerate() {
+            // TODO: consider using same_file here
+            if map.path.as_ref() == Some(&path) {
+                self.map_current = i;
+                return;
+            }
+        }
+
+        let (tx, rx) = mpsc::channel();
+
+        self.map_current = self.maps.len();
+        self.maps.push(EditorMap {
+            state: MapState::Loading(rx),
+            path: Some(path.clone()),
+            z_current: 0,
+            center: [0.0, 0.0],
+            rendered: Vec::new(),
+            edit_atoms: Vec::new(),
+            uid: self.uid,
+        });
+        self.uid += 1;
+
+        std::thread::spawn(move || {
+            let _ = tx.send(Map::from_file(&path).expect("TODO: proper error handling"));
+        });
+    }
+
+    fn close_map(&mut self) {
+        // TODO: prompt to save if dirty
+        if self.map_current + 1 == self.maps.len() {
+            self.maps.remove(self.map_current);
+            self.map_current = self.map_current.saturating_sub(1);
+        } else if self.map_current + 1 < self.maps.len() {
+            self.maps.remove(self.map_current);
+        }
+    }
+
+    fn save_map(&mut self) {
+        if let Some(map) = self.maps.get_mut(self.map_current) {
+            if let Some(hist) = map.state.hist() {
+                if map.path.is_none() {
+                    if let Ok(nfd::Response::Okay(fname)) = nfd::open_save_dialog(Some("dmm"), None) {
+                        map.path = Some(PathBuf::from(fname));
+                    } else {
+                        return;
+                    }
+                }
+                let path = map.path.as_ref().unwrap();
+                if let Err(e) = hist.current().save(map.state.base_dmm()).to_file(path) {
+                    self.errors.push(format!("Error writing {}:\n{}", path.display(), e));
+                }
+                hist.mark_clean();
+            }
+        }
+    }
+
+    fn save_map_as(&mut self, copy: bool) {
+        if let Some(map) = self.maps.get_mut(self.map_current) {
+            if let Some(hist) = map.state.hist() {
+                if let Ok(nfd::Response::Okay(fname)) = nfd::open_save_dialog(Some("dmm"), None) {
+                    let path = PathBuf::from(fname);
+                    if let Err(e) = hist.current().save(map.state.base_dmm()).to_file(&path) {
+                        self.errors.push(format!("Error writing {}:\n{}", path.display(), e));
+                    }
+                    if !copy {
+                        map.path = Some(path);
+                        hist.mark_clean();
+                    }
+                }
+            }
+        }
+    }
+
+    fn save_all(&mut self) {
+        let current = self.map_current;
+        self.map_current = 0;
+        while self.map_current < self.maps.len() {
+            self.save_map();
+            self.map_current += 1;
+        }
+        self.map_current = current;
+    }
+
+    fn toggle_layer(&mut self, which: usize) {
+        self.map_renderer.layers[which] = !self.map_renderer.layers[which];
+    }
+
+    fn tab_between_maps(&mut self, offset: isize) {
         if self.maps.is_empty() {
-            self.current_map = 0;
-            // clear the displays
-            return
+            return;
         }
+        self.map_current = (self.map_current as isize + self.maps.len() as isize + offset) as usize % self.maps.len();
+    }
 
-        if self.current_map >= self.maps.len() {
-            self.current_map = self.maps.len() - 1;
+    fn undo(&mut self) {
+        if let Some(env) = self.environment.as_ref() {
+            if let Some(map) = self.maps.get_mut(self.map_current) {
+                if let Some(hist) = map.state.hist_mut() {
+                    hist.undo(env);
+                }
+            }
         }
+    }
 
-        // ...
+    fn redo(&mut self) {
+        if let Some(env) = self.environment.as_ref() {
+            if let Some(map) = self.maps.get_mut(self.map_current) {
+                if let Some(hist) = map.state.hist_mut() {
+                    hist.redo(env);
+                }
+            }
+        }
     }
 }
 
-// ----------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
 // Helpers
 
-unsafe fn add_children(parent: &mut TreeWidgetItem, ty: TypeRef, tree: &ObjectTree) {
-    let mut children = ty.children(tree);
-    children.sort_unstable_by(|a, b| a.name.cmp(&b.name));
-    for each in children {
-        let mut child = TreeWidgetItem::new(());
-        child.set_text(0, qstr!(&each.name));
-        add_children(&mut child, each, tree);
-        parent.add_child(qt_own!(child));
+impl Environment {
+    fn find_closest_type(&self, mut path: &str) -> (bool, Option<TypeRef>) {
+        // find the "best" type by chopping the path if needed
+        let mut ty = self.objtree.find(path);
+        let red_paths = ty.is_none();
+        while ty.is_none() && !path.is_empty() {
+            match path.rfind("/") {
+                Some(idx) => path = &path[..idx],
+                None => break,
+            }
+            ty = self.objtree.find(path);
+        }
+        (red_paths, ty)
     }
 }
 
-fn show_error(window: &mut Widget, message: &str) {
-    use qt::widgets::message_box::*;
-    unsafe {
-        MessageBox::critical((
-            window as *mut Widget,
-            qstr!("Error"),
-            qstr!(message),
-            Flags::from_enum(StandardButton::Ok),
-        ));
+impl EditorMap {
+    fn clamp_center(&mut self) {
+        if let Some(hist) = self.state.hist() {
+            let (x, y, _) = hist.current().dim_xyz();
+            self.center[0] = self.center[0].min(x as f32 * 32.0).max(0.0);
+            self.center[1] = self.center[1].min(y as f32 * 32.0).max(0.0);
+        }
     }
 }
 
-fn ask_warning(window: &mut Widget, message: &str) -> bool {
-    use qt::widgets::message_box::*;
-    unsafe {
-        MessageBox::warning((
-            window as *mut Widget,
-            qstr!("Warning"),
-            qstr!(message),
-            Flags::from_enum(StandardButton::Ok) | Flags::from_enum(StandardButton::Cancel),
-        )) == StandardButton::Ok
+impl MapState {
+    fn base_dmm(&self) -> Option<&Map> {
+        match self {
+            MapState::Pending(ref map) => Some(map),
+            MapState::Preparing(ref map, _) => Some(map),
+            MapState::Active { ref merge_base, .. } => Some(merge_base),
+            _ => None,
+        }
     }
+
+    fn hist(&self) -> Option<&History> {
+        match self {
+            MapState::Active { ref hist, .. } => Some(hist),
+            _ => None,
+        }
+    }
+
+    fn hist_mut(&mut self) -> Option<&mut History> {
+        match self {
+            MapState::Active { ref mut hist, .. } => Some(hist),
+            _ => None,
+        }
+    }
+}
+
+impl EditPrefab {
+    fn new(fab: Prefab) -> EditPrefab {
+        EditPrefab {
+            filter: ImString::with_capacity(128),
+            fab,
+        }
+    }
+
+    fn menu(&mut self, ui: &Ui) {
+        ui.menu(im_str!("Filter...")).build(|| {
+            ui.input_text(im_str!(""), &mut self.filter).build();
+            if ui.menu_item(im_str!("Clear")).build() {
+                self.filter.clear();
+            }
+        });
+    }
+
+    fn show(&mut self, ui: &Ui, env: Option<&Environment>, extra_vars: bool) {
+        let EditPrefab {
+            ref mut filter,
+            ref mut fab,
+        } = self;
+
+        // find the "best" type by chopping the path if needed
+        let (red_paths, ty) = if let Some(env) = env.as_ref() {
+            env.find_closest_type(&fab.path)
+        } else {
+            (true, None)
+        };
+
+        // loop through instance vars, that type, parent types
+        // to find the longest var name for the column width
+        let mut max_len = 0;
+        for key in fab.vars.keys() {
+            max_len = std::cmp::max(max_len, key.len());
+        }
+        let mut search_ty = ty;
+        while let Some(search) = search_ty {
+            if search.is_root() {
+                break;
+            }
+            for (key, var) in search.vars.iter() {
+                if let Some(decl) = var.declaration.as_ref() {
+                    if !extra_vars && !decl.var_type.is_normal() {
+                        continue;
+                    }
+                    max_len = std::cmp::max(max_len, key.len());
+                }
+            }
+            search_ty = search.parent_type();
+        }
+        let offset = (max_len + 4) as f32 * 7.0;
+
+        // show the instance variables - everything which is
+        // actually set is right at the top
+        ui.text(im_str!("Instance variables ({})", fab.vars.len()));
+        for (name, value) in fab.vars.iter() {
+            if !name.contains(filter.to_str()) {
+                continue;
+            }
+            // TODO: red instead of green if invalid var
+            ui.with_style_and_color_vars(&[], GREEN_TEXT, || {
+                ui.text(im_str!("  {}", name));
+            });
+            ui.same_line(offset);
+            ui.text(im_str!("{}", value));
+        }
+
+        // show the red path on error
+        if red_paths {
+            ui.separator();
+            ui.with_style_and_color_vars(&[], RED_TEXT, || {
+                ui.text(im_str!("{}", &fab.path));
+            });
+        }
+
+        // show all the parent variables you could edit
+        let mut search_ty = ty;
+        while let Some(search) = search_ty {
+            if search.is_root() {
+                break;
+            }
+            ui.separator();
+            ui.text(im_str!("{} ({})", &search.path, search.vars.len()));
+
+            for (name, var) in search.vars.iter() {
+                if !name.contains(filter.to_str()) {
+                    continue;
+                }
+                if let Some(decl) = var.declaration.as_ref() {
+                    let mut prefix = " ";
+                    if !decl.var_type.is_normal() {
+                        if !extra_vars {
+                            continue;
+                        }
+                        prefix = "-";
+                    }
+                    ui.text(im_str!("{} {}", prefix, name));
+                    if prefix == "-" && ui.is_item_hovered() {
+                        ui.tooltip_text("/tmp, /static, or /const");
+                    }
+                    // search_ty is seeded with ty and must be Some to get here
+                    if let Some(value) = ty.unwrap().get_value(name) {
+                        if let Some(c) = value.constant.as_ref() {
+                            ui.same_line(offset);
+                            ui.text(im_str!("{}", c));
+                        }
+                    }
+                }
+            }
+
+            search_ty = search.parent_type();
+        }
+    }
+}
+
+fn root_node(ui: &Ui, ty: TypeRef, name: &str) {
+    if let Some(child) = ty.child(name) {
+        tree_node(ui, child);
+    }
+}
+
+fn tree_node(ui: &Ui, ty: TypeRef) {
+    let mut children = ty.children();
+    if children.is_empty() {
+        ui.tree_node(im_str!("{}", ty.name)).leaf(true).build(|| {});
+    } else {
+        children.sort_by_key(|t| &t.get().name);
+        ui.tree_node(im_str!("{}", ty.name)).build(|| {
+            for child in children {
+                tree_node(ui, child);
+            }
+        });
+    }
+}
+
+fn file_name(path: &Path) -> Cow<str> {
+    path.file_name().map_or("".into(), |s| s.to_string_lossy())
 }
 
 fn detect_environment(path: &Path) -> Option<PathBuf> {
@@ -564,4 +1525,165 @@ fn detect_environment(path: &Path) -> Option<PathBuf> {
         current = dir.parent();
     }
     None
+}
+
+fn prepare_tool_icon(
+    renderer: &mut ImRenderer,
+    environment: Option<&Environment>,
+    map_renderer: &mut map_renderer::MapRenderer,
+    icon: tools::ToolIcon,
+) -> tools::ToolIcon {
+    use tools::ToolIcon;
+    match icon {
+        ToolIcon::Dmi {
+            icon,
+            icon_state,
+            tint,
+            dir,
+        } => if let Some(env) = environment {
+            if let Some(id) = env.icons.get_index(icon.as_ref()) {
+                let icon = env.icons.get_icon(id);
+                if let Some([u1, v1, u2, v2]) = icon.uv_of(&icon_state, dir) {
+                    let tex = map_renderer
+                        .icon_textures
+                        .retrieve(&mut map_renderer.factory, &env.icons, id)
+                        .clone();
+                    let samp = map_renderer.sampler.clone();
+                    ToolIcon::Loaded {
+                        tex: renderer.textures().insert((tex, samp)),
+                        uv0: (u1, v1).into(),
+                        uv1: (u2, v2).into(),
+                        tint: Some(tint),
+                    }
+                } else {
+                    ToolIcon::None
+                }
+            } else {
+                ToolIcon::None
+            }
+        } else {
+            ToolIcon::Dmi {
+                icon,
+                icon_state,
+                tint,
+                dir,
+            }
+        },
+        ToolIcon::EmbeddedPng { data } => if let Ok(tex) = dmi::texture_from_bytes(&mut map_renderer.factory, data) {
+            let samp = map_renderer.sampler.clone();
+            ToolIcon::Loaded {
+                tex: renderer.textures().insert((tex, samp)),
+                uv0: (0.0, 0.0).into(),
+                uv1: (1.0, 1.0).into(),
+                tint: None,
+            }
+        } else {
+            ToolIcon::None
+        },
+        other => other,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Extension traits
+
+trait RetainMut<T> {
+    fn retain_mut<F: FnMut(&mut T) -> bool>(&mut self, f: F);
+}
+
+impl<T> RetainMut<T> for Vec<T> {
+    fn retain_mut<F: FnMut(&mut T) -> bool>(&mut self, mut f: F) {
+        let len = self.len();
+        let mut del = 0;
+        for i in 0..len {
+            if !f(&mut self[i]) {
+                del += 1;
+            } else if del > 0 {
+                self.swap(i - del, i);
+            }
+        }
+        if del > 0 {
+            self.truncate(len - del);
+        }
+    }
+}
+
+trait Fulfill<T> {
+    fn fulfill<F: FnOnce() -> T>(&mut self, f: F) -> &mut T;
+}
+
+impl<T> Fulfill<T> for Option<T> {
+    fn fulfill<F: FnOnce() -> T>(&mut self, f: F) -> &mut T {
+        if self.is_none() {
+            *self = Some(f());
+        }
+        self.as_mut().unwrap()
+    }
+}
+
+trait UiExt {
+    fn fits_width(&self, width: f32) -> usize;
+    fn objtree_menu<'e>(&self, env: &'e Environment, selection: &mut Option<TypeRef<'e>>);
+    fn tool_icon(&self, active: bool, icon: &tools::ToolIcon, fallback: &ImStr) -> bool;
+}
+
+impl<'a> UiExt for Ui<'a> {
+    fn fits_width(&self, element_width: f32) -> usize {
+        let (width, _) = self.get_window_size();
+        std::cmp::max(((width - 20.0) / (element_width + 8.0)) as usize, 1)
+    }
+
+    fn objtree_menu<'e>(&self, env: &'e Environment, selection: &mut Option<TypeRef<'e>>) {
+        let root = env.objtree.root();
+        objtree_menu_root(self, root, "area", selection);
+        objtree_menu_root(self, root, "turf", selection);
+        objtree_menu_root(self, root, "obj", selection);
+        objtree_menu_root(self, root, "mob", selection);
+    }
+
+    fn tool_icon(&self, active: bool, icon: &tools::ToolIcon, fallback: &ImStr) -> bool {
+        if let &tools::ToolIcon::Loaded { tex, uv0, uv1, tint } = icon {
+            let col = if active {
+                self.imgui().style().colors[ImGuiCol::FrameBgActive as usize]
+            } else {
+                self.imgui().style().colors[ImGuiCol::FrameBg as usize]
+            };
+            self.image(tex, (32.0, 32.0))
+                .uv0(uv0)
+                .uv1(uv1)
+                .border_col(col)
+                .tint_col(tint.unwrap_or(self.imgui().style().colors[ImGuiCol::Text as usize]))
+                .build();
+            self.is_item_hovered() && self.imgui().is_mouse_clicked(ImMouseButton::Left)
+        } else {
+            self.button(fallback, (34.0, 34.0))
+        }
+    }
+}
+
+fn objtree_menu_root<'e>(ui: &Ui, ty: TypeRef<'e>, name: &str, selection: &mut Option<TypeRef<'e>>) {
+    if let Some(child) = ty.child(name) {
+        objtree_menu_node(ui, child, selection);
+    }
+}
+
+fn objtree_menu_node<'e>(ui: &Ui, ty: TypeRef<'e>, selection: &mut Option<TypeRef<'e>>) {
+    let mut children = ty.children();
+    if children.is_empty() {
+        if ui.menu_item(im_str!("{}", ty.name)).build() {
+            *selection = Some(ty);
+        }
+    } else {
+        children.sort_by_key(|t| &t.get().name);
+        ui.menu(im_str!("{}", ty.name))
+            .build(|| {
+                if ui.menu_item(im_str!("{}", ty.name)).build() {
+                    *selection = Some(ty);
+                }
+                ui.separator();
+                for child in children {
+                    objtree_menu_node(ui, child, selection);
+                }
+            });
+    }
 }

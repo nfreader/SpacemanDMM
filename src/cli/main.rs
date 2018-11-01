@@ -1,4 +1,5 @@
 //! CLI tools, including a map renderer, using the same backend as the editor.
+#![forbid(unsafe_code)]
 
 extern crate rayon;
 extern crate structopt;
@@ -9,12 +10,12 @@ extern crate serde_json;
 #[macro_use] extern crate serde_derive;
 
 extern crate dreammaker as dm;
-#[macro_use] extern crate dmm_tools;
+extern crate dmm_tools;
 
-use std::fmt;
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicIsize, Ordering};
+use std::fmt;
 use std::path::Path;
+use std::sync::atomic::{AtomicIsize, Ordering};
 
 use structopt::StructOpt;
 
@@ -23,8 +24,6 @@ use dmm_tools::*;
 
 // ----------------------------------------------------------------------------
 // Main driver
-
-const DEFAULT_DME: &str = "tgstation.dme";
 
 fn main() {
     let opt = Opt::from_clap(&Opt::clap()
@@ -44,11 +43,6 @@ fn main() {
 
     run(&opt, &opt.command, &mut context);
 
-    #[cfg(feature="flame")] {
-        println!("Saving flame graph");
-        flame::dump_html(&mut std::io::BufWriter::new(std::fs::File::create(format!("{}/flame-graph.html", opt.output)).unwrap())).unwrap();
-    }
-
     std::process::exit(context.exit_status.into_inner() as i32);
 }
 
@@ -59,6 +53,7 @@ struct Context {
     icon_cache: icon_cache::IconCache,
     exit_status: AtomicIsize,
     parallel: bool,
+    procs: bool,
 }
 
 impl Context {
@@ -66,38 +61,34 @@ impl Context {
         let pathbuf;
         let environment: &std::path::Path = match opt.environment {
             Some(ref env) => env.as_ref(),
-            None => match detect_environment() {
-                Ok(Some(found)) => { pathbuf = found; &pathbuf },
-                _ => DEFAULT_DME.as_ref(),
-            }
+            None => match dm::detect_environment_default() {
+                Ok(Some(found)) => {
+                    pathbuf = found;
+                    &pathbuf
+                }
+                _ => dm::DEFAULT_ENV.as_ref(),
+            },
         };
         println!("parsing {}", environment.display());
-        flame!("parse");
-        match self.dm_context.parse_environment(environment) {
-            Ok(tree) => {
-                self.objtree = tree;
-            },
+
+        if let Some(parent) = environment.parent() {
+            self.icon_cache.set_icons_root(&parent);
+        }
+
+        let pp = match dm::preprocessor::Preprocessor::new(&self.dm_context, environment.to_owned()) {
+            Ok(pp) => pp,
             Err(e) => {
                 eprintln!("i/o error opening environment:\n{}", e);
                 std::process::exit(1);
             }
         };
-    }
-}
-
-fn detect_environment() -> std::io::Result<Option<std::path::PathBuf>> {
-    for entry in std::fs::read_dir(".")? {
-        if let Ok(entry) = entry {
-            let name = entry.file_name();
-            if {
-                let utf8_name = name.to_string_lossy();
-                utf8_name.ends_with(".dme") && utf8_name != DEFAULT_DME
-            } {
-                return Ok(Some(name.into()));
-            }
+        let indents = dm::indents::IndentProcessor::new(&self.dm_context, pp);
+        let mut parser = dm::parser::Parser::new(&self.dm_context, indents);
+        if self.procs {
+            parser.enable_procs();
         }
+        self.objtree = parser.parse_object_tree();
     }
-    Ok(None)
 }
 
 #[derive(StructOpt, Debug)]
@@ -135,20 +126,15 @@ enum Command {
         #[structopt(short="j", long="json")]
         json: bool,
     },
-    /// Dump the object tree to an XML file.
-    #[cfg(feature="xml")]
-    #[structopt(name = "objtree")]
-    ObjectTree {
-        /// The output filename.
-        #[structopt(default_value="objtree.xml")]
-        output: String,
-    },
     /// Check the environment for errors and warnings.
     #[structopt(name = "check")]
     Check {
         /// The minimum severity to print, of "error", "warning", "info", "hint".
         #[structopt(long="severity", default_value="info")]
         severity: String,
+        /// Check proc bodies as well as the object tree.
+        #[structopt(long="procs")]
+        procs: bool,
     },
     /// Build minimaps of the specified maps.
     #[structopt(name = "minimap")]
@@ -254,19 +240,7 @@ fn run(opt: &Opt, command: &Command, context: &mut Context) {
             }
         },
         // --------------------------------------------------------------------
-        #[cfg(feature="xml")]
-        Command::ObjectTree { ref output } => {
-            context.objtree(opt);
-            match context.objtree.to_xml(output) {
-                Ok(()) => println!("saved {}", output),
-                Err(e) => {
-                    println!("i/o error saving {}:\n{}", output, e);
-                    context.exit_status = 1;
-                }
-            }
-        },
-        // --------------------------------------------------------------------
-        Command::Check { ref severity } => {
+        Command::Check { ref severity, procs } => {
             let severity = match severity.as_str() {
                 "error" => dm::Severity::Error,
                 "warning" => dm::Severity::Warning,
@@ -274,8 +248,14 @@ fn run(opt: &Opt, command: &Command, context: &mut Context) {
                 _ => dm::Severity::Hint,
             };
             context.dm_context.set_print_severity(Some(severity));
+            context.procs = procs;
             context.objtree(opt);
-            *context.exit_status.get_mut() = context.dm_context.errors().iter().filter(|e| e.severity() <= severity).count() as isize;
+            *context.exit_status.get_mut() = context
+                .dm_context
+                .errors()
+                .iter()
+                .filter(|e| e.severity() <= severity)
+                .count() as isize;
         },
         // --------------------------------------------------------------------
         Command::Minimap {
@@ -283,10 +263,23 @@ fn run(opt: &Opt, command: &Command, context: &mut Context) {
             pngcrush, optipng,
         } => {
             context.objtree(opt);
-            if context.dm_context.errors().iter().filter(|e| e.severity() <= dm::Severity::Error).next().is_some() {
+            if context
+                .dm_context
+                .errors()
+                .iter()
+                .filter(|e| e.severity() <= dm::Severity::Error)
+                .next()
+                .is_some()
+            {
                 println!("there were some parsing errors; render may be inaccurate")
             }
-            let Context { ref objtree, ref icon_cache, ref exit_status, parallel, .. } = *context;
+            let Context {
+                ref objtree,
+                ref icon_cache,
+                ref exit_status,
+                parallel,
+                ..
+            } = *context;
 
             let render_passes = &dmm_tools::render_passes::configure(enable, disable);
             let paths: Vec<&Path> = files.iter().map(|p| p.as_ref()).collect();
@@ -302,7 +295,6 @@ fn run(opt: &Opt, command: &Command, context: &mut Context) {
                     "    ".to_owned()
                 };
 
-                flame!(path.file_name().unwrap().to_string_lossy().into_owned());
                 let map = match dmm::Map::from_file(path) {
                     Ok(map) => map,
                     Err(e) => {
@@ -314,7 +306,11 @@ fn run(opt: &Opt, command: &Command, context: &mut Context) {
 
                 let (dim_x, dim_y, dim_z) = map.dim_xyz();
                 let mut min = min.unwrap_or(CoordArg { x: 0, y: 0, z: 0 });
-                let mut max = max.unwrap_or(CoordArg { x: dim_x + 1, y: dim_y + 1, z: dim_z + 1 });
+                let mut max = max.unwrap_or(CoordArg {
+                    x: dim_x + 1,
+                    y: dim_y + 1,
+                    z: dim_z + 1,
+                });
                 min.x = clamp(min.x, 1, dim_x);
                 min.y = clamp(min.y, 1, dim_y);
                 min.z = clamp(min.z, 1, dim_z);
@@ -323,7 +319,7 @@ fn run(opt: &Opt, command: &Command, context: &mut Context) {
                 max.z = clamp(max.z, min.z, dim_z);
                 println!("{}rendering from {} to {}", prefix, min, max);
 
-                for z in (min.z - 1)..(max.z) {
+                let do_z_level = |z| {
                     println!("{}generating z={}", prefix, 1 + z);
                     let minimap_context = minimap::Context {
                         objtree: &objtree,
@@ -339,7 +335,12 @@ fn run(opt: &Opt, command: &Command, context: &mut Context) {
                         exit_status.fetch_add(1, Ordering::Relaxed);
                         return;
                     }
-                    let outfile = format!("{}/{}-{}.png", output, path.file_stem().unwrap().to_string_lossy(), 1 + z);
+                    let outfile = format!(
+                        "{}/{}-{}.png",
+                        output,
+                        path.file_stem().unwrap().to_string_lossy(),
+                        1 + z
+                    );
                     println!("{}saving {}", prefix, outfile);
                     image.to_file(outfile.as_ref()).unwrap();
                     if pngcrush {
@@ -363,6 +364,13 @@ fn run(opt: &Opt, command: &Command, context: &mut Context) {
                             .unwrap()
                             .success(), "optipng failed");
                     }
+                };
+
+                if parallel {
+                    use rayon::iter::{IntoParallelIterator, ParallelIterator};
+                    ((min.z - 1)..(max.z)).into_par_iter().for_each(do_z_level);
+                } else {
+                    ((min.z - 1)..(max.z)).into_iter().for_each(do_z_level);
                 }
             };
 
@@ -384,14 +392,12 @@ fn run(opt: &Opt, command: &Command, context: &mut Context) {
             for path in files.iter() {
                 let path: &std::path::Path = path.as_ref();
                 println!("{}", path.display());
-                flame!(path.file_name().unwrap().to_string_lossy().into_owned());
                 let mut map = dmm::Map::from_file(path).unwrap();
 
-                let linted = { flame!("lint"); lint::check(&context.objtree, &mut map) };
+                let linted = lint::check(&context.objtree, &mut map);
                 print!("{}", linted);
                 if !dry_run && (linted.any() || reformat) {
                     println!("    saving {}", path.display());
-                    flame!("save");
                     map.to_file(path).unwrap();
                 }
             }
@@ -484,13 +490,21 @@ impl std::str::FromStr for CoordArg {
     type Err = String;
 
     fn from_str(s: &str) -> Result<Self, String> {
-        match s.split(",").map(|x| x.parse()).collect::<Result<Vec<_>, std::num::ParseIntError>>() {
-            Ok(ref vec) if vec.len() == 2 => {
-                Ok(CoordArg { x: vec[0], y: vec[1], z: 0 })
-            }
-            Ok(ref vec) if vec.len() == 3 => {
-                Ok(CoordArg { x: vec[0], y: vec[1], z: vec[2] })
-            }
+        match s
+            .split(",")
+            .map(|x| x.parse())
+            .collect::<Result<Vec<_>, std::num::ParseIntError>>()
+        {
+            Ok(ref vec) if vec.len() == 2 => Ok(CoordArg {
+                x: vec[0],
+                y: vec[1],
+                z: 0,
+            }),
+            Ok(ref vec) if vec.len() == 3 => Ok(CoordArg {
+                x: vec[0],
+                y: vec[1],
+                z: vec[2],
+            }),
             Ok(_) => Err("must specify 2 or 3 coordinates".into()),
             Err(e) => Err(e.to_string()),
         }

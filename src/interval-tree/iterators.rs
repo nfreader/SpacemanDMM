@@ -11,11 +11,11 @@ enum Visiting {
 }
 
 /// An iterator over those members of an `IntervalTree` which intersect some range.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct RangePairIter<'a, K: 'a, V: 'a> {
     start: Bound<K>,
     end: Bound<K>,
-    stack: Vec<(&'a Node<K, V>, Visiting)>
+    stack: Vec<(&'a Node<K, V>, Visiting)>,
 }
 
 impl<'a, K: Ord, V> RangePairIter<'a, K, V> {
@@ -73,7 +73,7 @@ impl<'a, K: Ord, V> RangePairIter<'a, K, V> {
                         self.stack.push((node, Visiting::Right));
                     } else {
                         self.stack.push((node, Visiting::Middle(i + 1)));
-                        return Some((node, i))
+                        return Some((node, i));
                     }
                 }
             }
@@ -87,6 +87,16 @@ impl<'a, K: Ord + Clone, V> Iterator for RangePairIter<'a, K, V> {
 
     fn next(&mut self) -> Option<(RangeInclusive<K>, &'a V)> {
         self.get_next_node().map(|(n, i)| (n.key.clone(), &n.data[i]))
+    }
+}
+
+impl<'a, K: Clone, V> Clone for RangePairIter<'a, K, V> {
+    fn clone(&self) -> Self {
+        RangePairIter {
+            start: self.start.clone(),
+            end: self.end.clone(),
+            stack: self.stack.clone(),
+        }
     }
 }
 

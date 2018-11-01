@@ -1,6 +1,6 @@
 use dm::objtree::*;
 use dm::constants::Constant;
-use minimap::Atom;
+use minimap::{Atom, GetVar};
 
 pub mod transit_tube;
 pub mod random;
@@ -172,7 +172,8 @@ impl RenderPass for HideInvisible {
 #[derive(Default)]
 pub struct FakeGlass;
 impl RenderPass for FakeGlass {
-    fn overlays<'a>(&self,
+    fn overlays<'a>(
+        &self,
         atom: &mut Atom<'a>,
         _objtree: &'a ObjectTree,
         underlays: &mut Vec<Atom<'a>>,

@@ -1,5 +1,6 @@
 //! Utilities for managing the text document synchronization facilities of the
 //! language server protocol.
+#![allow(dead_code)]
 
 use std::io::{self, Read, BufRead};
 use std::borrow::Cow;
@@ -29,25 +30,26 @@ impl DocumentStore {
         }
     }
 
-    pub fn close(&mut self, id: TextDocumentIdentifier) -> Result<(), jsonrpc::Error> {
+    pub fn close(&mut self, id: TextDocumentIdentifier) -> Result<PathBuf, jsonrpc::Error> {
         let path = url_to_path(id.uri)?;
         match self.map.remove(&path) {
-            Some(_) => Ok(()),
+            Some(_) => Ok(path),
             None => Err(invalid_request("cannot close non-opened document")),
         }
     }
 
-    pub fn change(&mut self,
+    pub fn change(
+        &mut self,
         doc_id: VersionedTextDocumentIdentifier,
         changes: Vec<TextDocumentContentChangeEvent>,
-    ) -> Result<(), jsonrpc::Error> {
+    ) -> Result<PathBuf, jsonrpc::Error> {
         let path = url_to_path(doc_id.uri)?;
 
         // "If a versioned text document identifier is sent from the server to
         // the client and the file is not open in the editor (the server has
         // not received an open notification before) the server can send `null`
         // to indicate that the version is known and the content on disk is the
-	    // truth (as speced with document content ownership)."
+        // truth (as speced with document content ownership)."
         let new_version = match doc_id.version {
             Some(version) => version,
             None => return Err(invalid_request("don't know how to deal with this")),
@@ -65,11 +67,10 @@ impl DocumentStore {
         document.version = new_version;
 
         // Make an effort to apply all changes, even if one failed.
-        let mut result = Ok(());
+        let mut result = Ok(path);
         for change in changes {
-            let this_result = document.change(change);
-            if result.is_ok() {
-                result = this_result;
+            if let Err(e) = document.change(change) {
+                result = Err(e);
             }
         }
         result
@@ -87,7 +88,6 @@ impl DocumentStore {
         }
     }
 
-    #[allow(dead_code)]
     pub fn read(&self, path: &Path) -> io::Result<Box<io::Read>> {
         match self.map.get(path) {
             Some(document) => Ok(Box::new(Cursor::new(document.text.clone())) as Box<io::Read>),
@@ -104,7 +104,10 @@ struct Document {
 
 impl Document {
     fn new(version: u64, text: String) -> Document {
-        Document { version, text: Rc::new(text) }
+        Document {
+            version,
+            text: Rc::new(text),
+        }
     }
 
     fn change(&mut self, change: TextDocumentContentChangeEvent) -> Result<(), jsonrpc::Error> {
@@ -119,18 +122,9 @@ impl Document {
         };
 
         let start_pos = total_offset(&self.text, range.start.line, range.start.character)?;
-        splice(Rc::make_mut(&mut self.text), start_pos .. start_pos + range_length as usize, &change.text);
+        Rc::make_mut(&mut self.text).replace_range(start_pos..start_pos + range_length as usize, &change.text);
         Ok(())
     }
-}
-
-// Based on the unstable String::splice from libstd.
-fn splice(text: &mut String, range: ::std::ops::Range<usize>, replace_with: &str) {
-    assert!(text.is_char_boundary(range.start));
-    assert!(text.is_char_boundary(range.end));
-    unsafe {
-        text.as_mut_vec()
-    }.splice(range, replace_with.bytes());
 }
 
 /// Find the offset into the given text at which the given zero-indexed line
@@ -160,7 +154,7 @@ pub fn find_word(text: &str, offset: usize) -> &str {
             start_next -= 1;
         }
         if !text[start_next..start].chars().next().map_or(false, is_ident) {
-            break
+            break;
         }
         start = start_next;
     }
@@ -173,7 +167,7 @@ pub fn find_word(text: &str, offset: usize) -> &str {
             end_next += 1;
         }
         if !text[end..end_next].chars().next().map_or(false, is_ident) {
-            break
+            break;
         }
         end = end_next;
     }
@@ -222,5 +216,7 @@ impl BufRead for Cursor {
         let amt = ::std::cmp::min(self.pos, self.inner.as_ref().len() as u64);
         Ok(&self.inner.as_bytes()[(amt as usize)..])
     }
-    fn consume(&mut self, amt: usize) { self.pos += amt as u64; }
+    fn consume(&mut self, amt: usize) {
+        self.pos += amt as u64;
+    }
 }

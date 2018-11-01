@@ -1,15 +1,15 @@
 //! SS13 minimap generation tool
+#![deny(unsafe_code)]  // NB deny rather than forbid, ndarray macros use unsafe
+
 extern crate dreammaker as dm;
 
-extern crate png;
+#[cfg(feature="png")] extern crate png;
 extern crate lodepng;
 extern crate inflate;
 
 #[macro_use] extern crate ndarray;
 extern crate linked_hash_map;
 extern crate rand;
-
-#[cfg(feature="flame")] extern crate flame;
 
 #[macro_use] mod utils;
 pub mod dmm;

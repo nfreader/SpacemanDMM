@@ -1,10 +1,12 @@
 //! Parsing suite for DreamMaker, the language of the BYOND game engine.
-#[cfg(feature="xml-rs")] extern crate xml;
+#![forbid(unsafe_code)]
+
 extern crate petgraph;
 extern crate linked_hash_map;
 extern crate interval_tree;
 extern crate lodepng;
 #[macro_use] extern crate bitflags;
+extern crate noisy_float;
 
 use std::io;
 use std::path::Path;
@@ -17,13 +19,14 @@ macro_rules! try_iter {
             Ok(x) => x,
             Err(e) => return Some(Err(From::from(e))),
         }
-    }
+    };
 }
 
 mod error;
 pub use error::*;
 
 // roughly in order of stage
+pub mod docs;
 pub mod lexer;
 pub mod preprocessor;
 pub mod indents;
@@ -69,18 +72,25 @@ pub fn pretty_print<W, I>(w: &mut W, input: I, show_ws: bool) -> io::Result<()> 
             lexer::Token::Punct(lexer::Punctuation::LBrace) => {
                 indents += 1;
                 needs_newline = true;
-                if show_ws { write!(w, "{{")?; }
+                if show_ws {
+                    write!(w, "{{")?;
+                }
             }
             lexer::Token::Punct(lexer::Punctuation::RBrace) => {
                 indents -= 1;
                 needs_newline = true;
-                if show_ws { write!(w, "}}")?; }
+                if show_ws {
+                    write!(w, "}}")?;
+                }
             }
             lexer::Token::Punct(lexer::Punctuation::Semicolon) |
             lexer::Token::Punct(lexer::Punctuation::Newline) => {
                 needs_newline = true;
-                if show_ws { write!(w, ";")?; }
+                if show_ws {
+                    write!(w, ";")?;
+                }
             }
+            lexer::Token::DocComment(_) => {}
             other => {
                 if needs_newline {
                     const SPACES: &str = "                                ";
@@ -150,4 +160,33 @@ pub fn fix_case(path: &Path) -> Cow<Path> {
         }
     }
     Cow::Borrowed(path)
+}
+
+pub const DEFAULT_ENV: &str = "tgstation.dme";
+
+/// Autodetect any `.dme` file in the current folder, or fall back to default.
+///
+/// If multiple environments exist, the first non-default is preferred.
+pub fn detect_environment(root: &Path, default: &str) -> std::io::Result<Option<std::path::PathBuf>> {
+    let mut result = None;
+    for entry in std::fs::read_dir(root)? {
+        if let Ok(entry) = entry {
+            let name = entry.file_name();
+            let (dme, default) = {
+                let utf8_name = name.to_string_lossy();
+                (utf8_name.ends_with(".dme"), utf8_name == default)
+            };
+            if dme {
+                result = Some(entry.path());
+                if !default {
+                    break;
+                }
+            }
+        }
+    }
+    Ok(result)
+}
+
+pub fn detect_environment_default() -> std::io::Result<Option<std::path::PathBuf>> {
+    detect_environment("".as_ref(), DEFAULT_ENV)
 }
